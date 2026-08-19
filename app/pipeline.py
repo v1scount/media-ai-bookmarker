@@ -2,29 +2,51 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.config import Settings
-from app.models import ExtractionResult
+from app.models import (
+    ExtractionResult,
+    LinkRef,
+    MediaKind,
+    MediaRef,
+    PostContent,
+    SourceKind,
+    extract_status_id,
+    extract_supported_url,
+)
 from app.openrouter import OpenRouterClient
+from app.xfetch import LinkPreview, TweetData
 
 logger = logging.getLogger(__name__)
 
+MAX_TWEET_TITLE_CHARS = 120
+
 
 @dataclass
-class DownloadArtifacts:
+class SourceArtifacts:
+    """Everything a source yielded, whatever its media mix happens to be."""
+
     work_dir: Path
-    audio_path: Path | None
-    video_path: Path | None
-    title: str
-    creator: str
-    description: str
-    duration: float | None
-    video_id: str
+    source_kind: SourceKind
+    audio_path: Path | None = None
+    video_path: Path | None = None
+    # Tweet photos; video frames are sampled later and appended to these
+    image_paths: list[Path] = field(default_factory=list)
+    title: str = ""
+    creator: str = ""
+    description: str = ""
+    duration: float | None = None
+    source_id: str = ""
+    expanded_urls: list[str] = field(default_factory=list)
+    link_previews: list[LinkPreview] = field(default_factory=list)
+    # The verbatim post, available whether or not the model is going to be used
+    post: PostContent | None = None
 
 
 class Pipeline:
@@ -106,22 +128,40 @@ class Pipeline:
             if progress_cb:
                 await progress_cb(msg)
 
-        await progress("Downloading video…")
-        artifacts = await asyncio.to_thread(self._download, url, work_dir)
+        kind = detect_source_kind(url)
+        if kind == SourceKind.x:
+            await progress("Fetching post…")
+            artifacts = await asyncio.to_thread(self._download_x, url, work_dir)
+        else:
+            await progress("Downloading video…")
+            artifacts = await asyncio.to_thread(self._download, url, work_dir)
 
-        if artifacts.video_id:
-            cached = self._cache_get(artifacts.video_id)
+        source_key = self._source_cache_key(artifacts)
+        if source_key:
+            cached = self._cache_get(source_key)
             if cached is not None:
-                logger.info(
-                    "Cache hit for video id %s, skipping LLM call", artifacts.video_id
-                )
+                logger.info("Cache hit for %s, skipping LLM call", source_key)
                 await progress("Using cached extraction…")
                 self._cache_put(url, cached)
                 return cached
 
-        await progress("Transcribing audio…")
+        if artifacts.post is not None and not self._uses_llm(artifacts.source_kind):
+            logger.info("Raw capture for %s, no model call", url)
+            result = ExtractionResult(
+                source_url=url,
+                source_kind=artifacts.source_kind,
+                title=artifacts.title,
+                creator=artifacts.creator,
+                post=artifacts.post,
+            )
+            self._cache_put(url, result)
+            if source_key:
+                self._cache_put(source_key, result)
+            return result
+
         transcript = ""
         if artifacts.audio_path and artifacts.audio_path.exists():
+            await progress("Transcribing audio…")
             transcript = await asyncio.to_thread(
                 self._transcribe, artifacts.audio_path
             )
@@ -138,18 +178,17 @@ class Pipeline:
                 artifacts.duration,
             )
 
-        if not transcript and not frames:
-            logger.warning(
-                "No transcript and no frames for %s, skipping OpenRouter call", url
-            )
+        # Tweet photos come first: they are the post itself, frames are samples
+        images = (artifacts.image_paths + frames)[: self.settings.frame_count]
+
+        if not has_analysable_content(artifacts, transcript, images):
+            logger.warning("Nothing to analyse for %s, skipping OpenRouter call", url)
             return ExtractionResult(
                 source_url=url,
+                source_kind=artifacts.source_kind,
                 title=artifacts.title,
                 creator=artifacts.creator,
-                summary=(
-                    "No spoken audio or readable frames could be extracted from this "
-                    "video, so nothing was sent for analysis."
-                ),
+                summary=_empty_source_summary(artifacts.source_kind),
                 entities=[],
             )
 
@@ -160,20 +199,34 @@ class Pipeline:
             creator=artifacts.creator,
             description=artifacts.description,
             transcript=transcript,
-            frame_paths=frames,
+            frame_paths=images,
+            link_previews=artifacts.link_previews,
+            source_kind=artifacts.source_kind,
         )
-        # Title and creator always come from the video metadata, not the model
+        # Title, creator and source always come from metadata, not the model
         result.source_url = url
+        result.source_kind = artifacts.source_kind
         result.title = artifacts.title
         result.creator = artifacts.creator
 
         self._cache_put(url, result)
-        if artifacts.video_id:
-            self._cache_put(artifacts.video_id, result)
+        if source_key:
+            self._cache_put(source_key, result)
         return result
 
-    def _download(self, url: str, work_dir: Path) -> DownloadArtifacts:
-        from app.download import download_tiktok, pick_media_files
+    def _uses_llm(self, kind: SourceKind) -> bool:
+        """TikTok always needs the model; X only when explicitly enabled."""
+        return kind != SourceKind.x or self.settings.x_use_llm
+
+    @staticmethod
+    def _source_cache_key(artifacts: SourceArtifacts) -> str:
+        """Namespaced so a tweet id can never collide with a TikTok video id."""
+        if not artifacts.source_id:
+            return ""
+        return f"{artifacts.source_kind.value}:{artifacts.source_id}"
+
+    def _download(self, url: str, work_dir: Path) -> SourceArtifacts:
+        from app.download import download_tiktok
 
         cookies = self.settings.ytdlp_cookies_file
         info = download_tiktok(url, work_dir, cookies_file=cookies)
@@ -185,7 +238,103 @@ class Pipeline:
             or (info or {}).get("channel")
             or ""
         )
-        description = (info or {}).get("description") or ""
+        video_path, audio_path, duration = self._prepare_media(info, work_dir, url)
+
+        return SourceArtifacts(
+            work_dir=work_dir,
+            source_kind=SourceKind.tiktok,
+            audio_path=audio_path,
+            video_path=video_path,
+            title=title,
+            creator=creator,
+            description=(info or {}).get("description") or "",
+            duration=duration,
+            source_id=str((info or {}).get("id") or ""),
+        )
+
+    def _download_x(self, url: str, work_dir: Path) -> SourceArtifacts:
+        from app.download import download_x_video
+        from app.xfetch import (
+            download_photos,
+            fetch_link_previews,
+            fetch_tweet,
+            resolve_redirect,
+        )
+
+        status_id = extract_status_id(url) or extract_status_id(resolve_redirect(url))
+        if not status_id:
+            raise ValueError("That X link has no post id in it.")
+
+        tweet = fetch_tweet(status_id)
+        canonical = canonical_x_url(tweet.author_handle, tweet.tweet_id)
+        link_previews = fetch_link_previews(tweet.all_urls)
+        use_llm = self.settings.x_use_llm
+
+        # Media is only fetched here to feed the model. A raw capture records the
+        # URLs instead, and downloads photos straight into the vault on save.
+        photos: list[Path] = []
+        video_path: Path | None = None
+        audio_path: Path | None = None
+        duration: float | None = None
+        if use_llm:
+            if tweet.photo_urls and self.model_supports_images:
+                photos = download_photos(
+                    tweet.photo_urls,
+                    work_dir / "photos",
+                    limit=self.settings.frame_count,
+                )
+            if tweet.has_video:
+                try:
+                    info = download_x_video(
+                        canonical,
+                        work_dir,
+                        cookies_file=self.settings.ytdlp_cookies_file,
+                    )
+                    video_path, audio_path, duration = self._prepare_media(
+                        info, work_dir, canonical
+                    )
+                except Exception as exc:
+                    # The tweet text and its links are still worth extracting
+                    logger.warning("X video download failed for %s: %s", canonical, exc)
+
+        logger.info(
+            "Tweet %s: photos=%s videos=%s links=%s llm=%s",
+            tweet.tweet_id,
+            len(tweet.photo_urls),
+            len(tweet.video_urls),
+            len(link_previews),
+            use_llm,
+        )
+
+        description = tweet.text
+        if tweet.quoted_text:
+            description = f"{description}\n\nquoted post:\n{tweet.quoted_text}"
+
+        return SourceArtifacts(
+            work_dir=work_dir,
+            source_kind=SourceKind.x,
+            audio_path=audio_path,
+            video_path=video_path,
+            image_paths=photos,
+            title=tweet_title(tweet.text, tweet.author_handle),
+            creator=tweet.author_handle or tweet.author_name,
+            description=description,
+            duration=duration,
+            source_id=tweet.tweet_id,
+            expanded_urls=[preview.url for preview in link_previews],
+            link_previews=link_previews,
+            post=build_post_content(tweet, link_previews),
+        )
+
+    def _prepare_media(
+        self,
+        info: dict | None,
+        work_dir: Path,
+        url: str,
+    ) -> tuple[Path | None, Path | None, float | None]:
+        """Turn what yt-dlp wrote into (video, 16 kHz mono wav, duration)."""
+        from app.download import pick_media_files
+
         duration = (info or {}).get("duration")
         if duration is not None:
             try:
@@ -248,16 +397,7 @@ class Pipeline:
                 logger.warning("Audio extraction produced nothing for %s", audio_source)
                 audio_path = None
 
-        return DownloadArtifacts(
-            work_dir=work_dir,
-            audio_path=audio_path,
-            video_path=video_path,
-            title=title,
-            creator=creator,
-            description=description,
-            duration=duration,
-            video_id=str((info or {}).get("id") or ""),
-        )
+        return video_path, audio_path, duration
 
     def _transcribe(self, audio_path: Path) -> str:
         model = self._load_whisper()
@@ -408,11 +548,96 @@ class Pipeline:
         logger.warning("ffmpeg soft-fail (%s): %s", result.returncode, summary)
 
 
+def detect_source_kind(url: str) -> SourceKind:
+    """Which pipeline branch a URL belongs to; TikTok stays the default."""
+    match = extract_supported_url(url)
+    return match[0] if match else SourceKind.tiktok
+
+
+def canonical_x_url(handle: str, tweet_id: str) -> str:
+    """An x.com URL yt-dlp understands, whichever mirror domain was pasted."""
+    name = (handle or "").lstrip("@")
+    return f"https://x.com/{name or 'i'}/status/{tweet_id}"
+
+
+def build_post_content(
+    tweet: TweetData,
+    link_previews: list[LinkPreview],
+) -> PostContent:
+    """Capture a post verbatim: its text, its links, and what media it carries."""
+    text = tweet.text.strip()
+    if tweet.quoted_text:
+        text = f"{text}\n\n> {tweet.quoted_text.strip()}".strip()
+
+    previewed = {preview.url for preview in link_previews}
+    links = [
+        LinkRef(
+            url=preview.url,
+            title=preview.title,
+            description=preview.description,
+        )
+        for preview in link_previews
+    ]
+    # Links we never previewed (skipped hosts, or over the cap) still belong here
+    links.extend(
+        LinkRef(url=url) for url in tweet.all_urls if url not in previewed
+    )
+
+    media = [MediaRef(kind=MediaKind.image, url=url) for url in tweet.photo_urls]
+    media.extend(MediaRef(kind=MediaKind.video, url=url) for url in tweet.video_urls)
+
+    return PostContent(text=text, links=links, media=media)
+
+
+def tweet_title(text: str, handle: str = "") -> str:
+    """A one-line note title from the tweet body, links stripped."""
+    without_urls = re.sub(r"https?://\S+", "", text or "")
+    collapsed = re.sub(r"\s+", " ", without_urls).strip()
+    if not collapsed:
+        return f"Post by {handle}" if handle else "X post"
+    if len(collapsed) <= MAX_TWEET_TITLE_CHARS:
+        return collapsed
+    return collapsed[:MAX_TWEET_TITLE_CHARS].rstrip() + "…"
+
+
+def has_analysable_content(
+    artifacts: SourceArtifacts,
+    transcript: str,
+    images: list[Path],
+) -> bool:
+    """Whether there is enough here to be worth an OpenRouter call.
+
+    A TikTok caption alone is not enough — the caption is usually hashtags — but
+    an X post is mostly text, so its body or a link preview is the whole point.
+    """
+    if transcript or images:
+        return True
+    if artifacts.source_kind == SourceKind.x:
+        return bool(artifacts.description.strip() or artifacts.link_previews)
+    return False
+
+
+def _empty_source_summary(kind: SourceKind) -> str:
+    if kind == SourceKind.x:
+        return (
+            "This post had no text, links, or images to analyse, so nothing was "
+            "sent for extraction."
+        )
+    return (
+        "No spoken audio or readable frames could be extracted from this video, "
+        "so nothing was sent for analysis."
+    )
+
+
 def format_preview(result: ExtractionResult) -> str:
     from app.models import Confidence
 
+    fallback = "X extract" if result.source_kind == SourceKind.x else "TikTok extract"
+    if result.post is not None:
+        return _format_raw_preview(result, fallback)
+
     lines = [
-        f"<b>{_html(result.title or 'TikTok extract')}</b>",
+        f"<b>{_html(result.title or fallback)}</b>",
         f"by {_html(result.creator or 'unknown')}",
         "",
         _html(result.summary or "(no summary)"),
@@ -438,6 +663,38 @@ def format_preview(result: ExtractionResult) -> str:
                 f"• {star}<b>{_html(ent.type.value)}</b> — {_html(ent.name)}"
                 f"{author}{link}{uncertain}{notes}"
             )
+    lines.extend(["", f'<a href="{_html(result.source_url)}">Source</a>'])
+    return "\n".join(lines)
+
+
+def _format_raw_preview(result: ExtractionResult, fallback: str) -> str:
+    """Preview for a note captured verbatim: no summary, no extracted items."""
+    post = result.post
+    assert post is not None
+
+    lines = [
+        f"<b>{_html(result.title or fallback)}</b>",
+        f"by {_html(result.creator or 'unknown')}",
+    ]
+    if post.text:
+        lines.extend(["", _html(post.text)])
+
+    if post.links:
+        lines.extend(["", "<b>Links</b>"])
+        for link in post.links:
+            label = link.title or link.url
+            lines.append(f'• <a href="{_html(link.url)}">{_html(label)}</a>')
+
+    photos = len(post.images)
+    videos = len(post.videos)
+    if photos or videos:
+        parts = []
+        if photos:
+            parts.append(f"{photos} photo{'s' if photos != 1 else ''}")
+        if videos:
+            parts.append(f"{videos} video{'s' if videos != 1 else ''}")
+        lines.extend(["", f"<i>{' + '.join(parts)} attached</i>"])
+
     lines.extend(["", f'<a href="{_html(result.source_url)}">Source</a>'])
     return "\n".join(lines)
 

@@ -13,7 +13,36 @@ TIKTOK_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# x.com plus the mirror domains people paste when they want an inline preview
+X_HOSTS = (
+    "x.com",
+    "twitter.com",
+    "vxtwitter.com",
+    "fxtwitter.com",
+    "fixupx.com",
+    "fixvx.com",
+    "twittpr.com",
+)
+
+# Only post URLs are actionable, so a bare profile link is deliberately not matched
+X_URL_RE = re.compile(
+    r"https?://(?:(?:www|mobile|m)\.)?(?:"
+    + "|".join(host.replace(".", r"\.") for host in X_HOSTS)
+    + r")/(?:[^\s<>\"'/]+/)*status(?:es)?/\d+[^\s<>\"']*",
+    re.IGNORECASE,
+)
+
+# Matches /status/123, /statuses/123 and /i/status/123, with or without a suffix
+X_STATUS_ID_RE = re.compile(r"/status(?:es)?/(\d+)", re.IGNORECASE)
+
+TRAILING_PUNCTUATION = ").,];>"
+
 SEARCH_URL_TEMPLATE = "https://www.google.com/search?q={query}"
+
+
+class SourceKind(str, Enum):
+    tiktok = "tiktok"
+    x = "x"
 
 
 class EntityType(str, Enum):
@@ -165,14 +194,83 @@ class Entity(BaseModel):
         return SEARCH_URL_TEMPLATE.format(query=quote_plus(query))
 
 
+class MediaKind(str, Enum):
+    image = "image"
+    video = "video"
+
+
+class LinkRef(BaseModel):
+    """A link found in a post, with whatever the page told us about itself."""
+
+    url: str
+    title: str = ""
+    description: str = ""
+
+    @field_validator("title", "description", "url", mode="before")
+    @classmethod
+    def coerce_null_strings(cls, value: object) -> object:
+        return _none_to_empty(value)
+
+
+class MediaRef(BaseModel):
+    kind: MediaKind = MediaKind.image
+    url: str = ""
+    # Vault-relative path, filled in only once the file is saved into the vault
+    vault_path: str = ""
+
+    @field_validator("url", "vault_path", mode="before")
+    @classmethod
+    def coerce_null_strings(cls, value: object) -> object:
+        return _none_to_empty(value)
+
+
+class PostContent(BaseModel):
+    """A post captured verbatim, for notes built without the model."""
+
+    text: str = ""
+    links: list[LinkRef] = Field(default_factory=list)
+    media: list[MediaRef] = Field(default_factory=list)
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def coerce_null_strings(cls, value: object) -> object:
+        return _none_to_empty(value)
+
+    @property
+    def images(self) -> list[MediaRef]:
+        return [item for item in self.media if item.kind == MediaKind.image]
+
+    @property
+    def videos(self) -> list[MediaRef]:
+        return [item for item in self.media if item.kind == MediaKind.video]
+
+
 class ExtractionResult(BaseModel):
     source_url: str
-    # title and creator come from yt-dlp metadata, never from the model
+    # title, creator and source_kind come from the pipeline, never from the model
+    source_kind: SourceKind = SourceKind.tiktok
     title: str = ""
     creator: str = ""
     summary: str = ""
     video_kind: VideoKind = VideoKind.other
     entities: list[Entity] = Field(default_factory=list)
+    # Set only for notes captured verbatim instead of sent to the model
+    post: Optional[PostContent] = None
+
+    @property
+    def is_raw_capture(self) -> bool:
+        return self.post is not None
+
+    @field_validator("source_kind", mode="before")
+    @classmethod
+    def coerce_source_kind(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            try:
+                return SourceKind(normalized)
+            except ValueError:
+                return SourceKind.tiktok
+        return SourceKind.tiktok if value is None else value
 
     @field_validator("title", "creator", "summary", "source_url", mode="before")
     @classmethod
@@ -204,10 +302,60 @@ class ExtractionResult(BaseModel):
 
 def extract_tiktok_url(text: str) -> Optional[str]:
     """Return the first TikTok URL found in text, or None."""
+    return _first_url(TIKTOK_URL_RE, text)
+
+
+def extract_x_url(text: str) -> Optional[str]:
+    """Return the first X/Twitter status URL found in text, or None.
+
+    Profile links (x.com/alice) are ignored; only /status/{id} counts.
+    """
     if not text:
         return None
-    match = TIKTOK_URL_RE.search(text)
+    for match in X_URL_RE.finditer(text):
+        url = match.group(0).rstrip(TRAILING_PUNCTUATION)
+        if extract_status_id(url):
+            return url
+    return None
+
+
+def extract_supported_url(text: str) -> Optional[tuple[SourceKind, str]]:
+    """Return (kind, url) for whichever supported link appears first in text."""
+    if not text:
+        return None
+    candidates: list[tuple[int, SourceKind, str]] = []
+    tiktok = TIKTOK_URL_RE.search(text)
+    if tiktok:
+        candidates.append(
+            (
+                tiktok.start(),
+                SourceKind.tiktok,
+                tiktok.group(0).rstrip(TRAILING_PUNCTUATION),
+            )
+        )
+    for match in X_URL_RE.finditer(text):
+        url = match.group(0).rstrip(TRAILING_PUNCTUATION)
+        if extract_status_id(url):
+            candidates.append((match.start(), SourceKind.x, url))
+            break
+    if not candidates:
+        return None
+    _start, kind, url = min(candidates, key=lambda item: item[0])
+    return kind, url
+
+
+def extract_status_id(url: str) -> Optional[str]:
+    """Return the numeric tweet id from an X status URL, or None."""
+    if not url:
+        return None
+    match = X_STATUS_ID_RE.search(url)
+    return match.group(1) if match else None
+
+
+def _first_url(pattern: re.Pattern[str], text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = pattern.search(text)
     if not match:
         return None
-    url = match.group(0).rstrip(").,];>")
-    return url
+    return match.group(0).rstrip(TRAILING_PUNCTUATION)

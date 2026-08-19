@@ -18,6 +18,12 @@ TIKTOK_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+X_HEADERS = {
+    "User-Agent": CHROME_UA,
+    "Referer": "https://x.com/",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 def resolve_tiktok_url(url: str) -> str:
     """Follow short-link redirects (vm/vt) to a canonical tiktok.com URL when possible."""
@@ -103,7 +109,11 @@ def pick_media_files(
     return video, audio
 
 
-def _base_ydl_opts(work_dir: Path, cookies_file: Optional[Path]) -> dict[str, Any]:
+def _base_ydl_opts(
+    work_dir: Path,
+    cookies_file: Optional[Path],
+    headers: dict[str, str] = TIKTOK_HEADERS,
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "outtmpl": str(work_dir / "media.%(ext)s"),
         "quiet": True,
@@ -114,7 +124,7 @@ def _base_ydl_opts(work_dir: Path, cookies_file: Optional[Path]) -> dict[str, An
         "format": "b/bv*+ba/bv*",
         "merge_output_format": "mp4",
         "paths": {"home": str(work_dir)},
-        "http_headers": dict(TIKTOK_HEADERS),
+        "http_headers": dict(headers),
     }
     usable = _usable_cookies(cookies_file)
     if usable:
@@ -172,3 +182,26 @@ def download_tiktok(
 
     assert last_error is not None
     raise last_error
+
+
+def download_x_video(
+    url: str,
+    work_dir: Path,
+    *,
+    cookies_file: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Download the video attached to an X post.
+
+    Single attempt: unlike TikTok there are no extractor host workarounds worth
+    trying, and a failure here is non-fatal because the tweet text still carries
+    the useful content.
+    """
+    import yt_dlp
+
+    for leftover in work_dir.glob("media.*"):
+        leftover.unlink(missing_ok=True)
+
+    opts = _base_ydl_opts(work_dir, cookies_file, X_HEADERS)
+    logger.info("yt-dlp X video url=%s", url)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=True) or {}

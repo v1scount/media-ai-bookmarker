@@ -3,6 +3,7 @@
 Usage:
   python -m app.cli "https://www.tiktok.com/@user/video/123"
   python -m app.cli "https://vm.tiktok.com/xxx" --save
+  python -m app.cli "https://x.com/user/status/123"
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import logging
 import sys
 
 from app.config import get_settings
-from app.models import extract_tiktok_url
+from app.models import extract_supported_url
 from app.obsidian import relative_vault_path, save_to_obsidian
 from app.openrouter import OpenRouterClient
 from app.pipeline import Pipeline, format_preview
@@ -50,8 +51,10 @@ async def _run(url: str, save: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run TikTok extraction pipeline")
-    parser.add_argument("url", help="TikTok URL")
+    parser = argparse.ArgumentParser(
+        description="Run the TikTok / X extraction pipeline"
+    )
+    parser.add_argument("url", help="TikTok or X post URL")
     parser.add_argument(
         "--save",
         action="store_true",
@@ -59,12 +62,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    url = extract_tiktok_url(args.url) or args.url
-    if "tiktok.com" not in url.lower():
-        print("Not a TikTok URL", file=sys.stderr)
+    match = extract_supported_url(args.url)
+    if not match:
+        print("Not a supported URL (TikTok or X post)", file=sys.stderr)
         return 2
 
-    return asyncio.run(_run(url, args.save))
+    return asyncio.run(_run(match[1], args.save))
 
 
 if __name__ == "__main__":

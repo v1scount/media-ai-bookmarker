@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from app.config import Settings, _parse_user_ids
@@ -14,12 +15,33 @@ from app.models import (
     Entity,
     EntityType,
     ExtractionResult,
+    LinkRef,
+    MediaKind,
+    MediaRef,
+    PostContent,
+    SourceKind,
     VideoKind,
+    extract_status_id,
+    extract_supported_url,
     extract_tiktok_url,
+    extract_x_url,
 )
-from app.obsidian import render_markdown, save_to_obsidian
+from app.obsidian import build_note_filename, render_markdown, save_to_obsidian
 from app.openrouter import RESULT_JSON_SCHEMA, truncate_text
-from app.pipeline import Pipeline
+from app.pipeline import (
+    Pipeline,
+    SourceArtifacts,
+    build_post_content,
+    format_preview,
+    has_analysable_content,
+)
+from app.xfetch import (
+    LinkPreview,
+    TweetData,
+    parse_open_graph,
+    should_preview,
+    tweet_data_from_json,
+)
 
 
 class CookiesHelperTests(unittest.TestCase):
@@ -86,6 +108,89 @@ class UrlParseTests(unittest.TestCase):
 
     def test_none(self) -> None:
         self.assertIsNone(extract_tiktok_url("no link here"))
+
+
+class XUrlParseTests(unittest.TestCase):
+    def test_x_com_status(self) -> None:
+        url = "https://x.com/alice/status/1234567890123456789"
+        self.assertEqual(extract_x_url(f"see {url} now"), url)
+        self.assertEqual(extract_status_id(url), "1234567890123456789")
+
+    def test_twitter_com(self) -> None:
+        url = "https://twitter.com/alice/status/99"
+        self.assertEqual(extract_x_url(url), url)
+        self.assertEqual(extract_status_id(url), "99")
+
+    def test_www_and_mobile(self) -> None:
+        self.assertEqual(
+            extract_status_id("https://www.twitter.com/u/status/1"),
+            "1",
+        )
+        self.assertEqual(
+            extract_status_id("https://mobile.twitter.com/u/status/2"),
+            "2",
+        )
+
+    def test_i_status(self) -> None:
+        self.assertEqual(extract_status_id("https://x.com/i/status/42"), "42")
+        self.assertEqual(extract_x_url("https://x.com/i/status/42"), "https://x.com/i/status/42")
+
+    def test_wrappers(self) -> None:
+        for host in ("vxtwitter.com", "fxtwitter.com", "fixupx.com"):
+            url = f"https://{host}/alice/status/99"
+            self.assertEqual(extract_x_url(url), url, host)
+            self.assertEqual(extract_status_id(url), "99", host)
+
+    def test_query_string_still_yields_id(self) -> None:
+        self.assertEqual(
+            extract_status_id("https://x.com/u/status/123?s=20"),
+            "123",
+        )
+
+    def test_strips_trailing_punct(self) -> None:
+        self.assertEqual(
+            extract_x_url("(https://x.com/u/status/1)."),
+            "https://x.com/u/status/1",
+        )
+
+    def test_profile_is_not_a_status(self) -> None:
+        self.assertIsNone(extract_x_url("https://x.com/alice"))
+        self.assertIsNone(extract_status_id("https://x.com/alice"))
+        self.assertIsNone(extract_x_url("no link here"))
+
+    def test_supported_prefers_first_tiktok(self) -> None:
+        text = (
+            "https://www.tiktok.com/@u/video/1 then "
+            "https://x.com/u/status/2"
+        )
+        self.assertEqual(
+            extract_supported_url(text),
+            (SourceKind.tiktok, "https://www.tiktok.com/@u/video/1"),
+        )
+
+    def test_supported_prefers_first_x(self) -> None:
+        text = (
+            "https://x.com/u/status/2 then "
+            "https://www.tiktok.com/@u/video/1"
+        )
+        self.assertEqual(
+            extract_supported_url(text),
+            (SourceKind.x, "https://x.com/u/status/2"),
+        )
+
+    def test_supported_none(self) -> None:
+        self.assertIsNone(extract_supported_url("hello"))
+
+    def test_supported_skips_profile_for_later_tiktok(self) -> None:
+        text = "https://x.com/alice https://www.tiktok.com/@u/video/1"
+        self.assertEqual(
+            extract_supported_url(text),
+            (SourceKind.tiktok, "https://www.tiktok.com/@u/video/1"),
+        )
+
+    def test_extraction_defaults_source_kind_tiktok(self) -> None:
+        result = ExtractionResult(source_url="u")
+        self.assertEqual(result.source_kind, SourceKind.tiktok)
 
 
 class ExtractionSchemaTests(unittest.TestCase):
@@ -180,7 +285,7 @@ class TokenGuardTests(unittest.TestCase):
         self.assertTrue(RESULT_JSON_SCHEMA["strict"])
         self.assertFalse(schema["additionalProperties"])
         # Metadata we already know locally is never requested from the model
-        for field in ("source_url", "title", "creator"):
+        for field in ("source_url", "title", "creator", "source_kind"):
             self.assertNotIn(field, schema["properties"])
 
     def test_every_schema_field_is_documented(self) -> None:
@@ -334,7 +439,7 @@ class ObsidianTests(unittest.TestCase):
                 TELEGRAM_BOT_TOKEN="x",
                 OPENROUTER_API_KEY="x",
                 OBSIDIAN_VAULT_PATH=tmp,
-                OBSIDIAN_RELATIVE_DIR="TikTok Extracts",
+                OBSIDIAN_RELATIVE_DIR="Extracts",
                 ALLOWED_TELEGRAM_USER_IDS="1",
                 PUID=-1,
                 PGID=-1,
@@ -345,6 +450,565 @@ class ObsidianTests(unittest.TestCase):
             # Second save should not clobber
             path2 = save_to_obsidian(settings, result)
             self.assertNotEqual(path, path2)
+
+    def test_x_tags_and_source_kind(self) -> None:
+        result = ExtractionResult(
+            source_url="https://x.com/u/status/1",
+            source_kind=SourceKind.x,
+            title="A tweet about a book",
+        )
+        md = render_markdown(result)
+        self.assertIn("tags: [x, extract]", md)
+        self.assertIn("source_kind: x", md)
+        self.assertNotIn("tags: [tiktok, extract]", md)
+
+    def test_x_handle_is_quoted_in_frontmatter(self) -> None:
+        # A bare "@handle" is invalid YAML and breaks every Obsidian property
+        result = ExtractionResult(
+            source_url="https://x.com/u/status/1",
+            source_kind=SourceKind.x,
+            creator="@alice",
+        )
+        md = render_markdown(result)
+        self.assertIn('creator: "@alice"', md)
+
+    def test_plain_creator_is_left_unquoted(self) -> None:
+        result = ExtractionResult(source_url="u", creator="someuser")
+        md = render_markdown(result)
+        self.assertIn("creator: someuser", md)
+        # created stays a bare scalar so Obsidian still types it as a date
+        self.assertNotIn('created: "', md)
+
+    def test_creator_with_colon_is_quoted(self) -> None:
+        result = ExtractionResult(source_url="u", creator="News: Daily")
+        md = render_markdown(result)
+        self.assertIn('creator: "News: Daily"', md)
+
+    def test_frontmatter_parses_as_yaml(self) -> None:
+        yaml = __import__("importlib").util.find_spec("yaml")
+        if yaml is None:
+            self.skipTest("PyYAML not installed")
+        import yaml as yaml_mod
+
+        result = ExtractionResult(
+            source_url="https://x.com/u/status/1",
+            source_kind=SourceKind.x,
+            creator="@alice",
+            title='A "quoted" post: part 2',
+        )
+        block = render_markdown(result).split("---")[1]
+        data = yaml_mod.safe_load(block)
+        self.assertEqual(data["creator"], "@alice")
+        self.assertEqual(data["source_kind"], "x")
+        self.assertEqual(data["tags"], ["x", "extract"])
+
+    def test_tiktok_frontmatter_includes_source_kind(self) -> None:
+        result = ExtractionResult(source_url="u")
+        md = render_markdown(result)
+        self.assertIn("tags: [tiktok, extract]", md)
+        self.assertIn("source_kind: tiktok", md)
+
+    def test_x_filename_slug_fallback(self) -> None:
+        result = ExtractionResult(
+            source_url="https://x.com/u/status/1",
+            source_kind=SourceKind.x,
+            title="!!!",
+        )
+        self.assertIn("x-extract", build_note_filename(result))
+
+    def test_tiktok_filename_slug_fallback(self) -> None:
+        result = ExtractionResult(source_url="u", title="!!!")
+        self.assertIn("tiktok-extract", build_note_filename(result))
+
+
+FX_TWEET_FIXTURE = {
+    "code": 200,
+    "message": "OK",
+    "tweet": {
+        "id": "1234567890123456789",
+        "text": "Great article on note-taking https://t.co/abcd",
+        "author": {"name": "Alice Example", "screen_name": "alice"},
+        "media": {
+            "photos": [
+                {
+                    "type": "photo",
+                    "url": "https://pbs.twimg.com/media/photo1.jpg",
+                    "width": 100,
+                    "height": 100,
+                }
+            ]
+        },
+        "quote": {
+            "id": "111",
+            "text": "Original take https://quoted.example/post",
+            "author": {"name": "Bob", "screen_name": "bob"},
+        },
+        "entities": {
+            "urls": [
+                {
+                    "url": "https://t.co/abcd",
+                    "expanded_url": "https://example.com/article",
+                }
+            ]
+        },
+    },
+}
+
+VX_TWEET_FIXTURE = {
+    "tweetID": "1234567890123456789",
+    "text": "Check this https://example.com/article",
+    "user_name": "Alice Example",
+    "user_screen_name": "alice",
+    "media_extended": [
+        {"type": "image", "url": "https://pbs.twimg.com/media/photo1.jpg"},
+        {"type": "video", "url": "https://video.twimg.com/ext_tw_video/foo.mp4"},
+    ],
+    "qrt": {
+        "text": "Quoted thought https://other.example/page",
+        "user_screen_name": "bob",
+    },
+}
+
+
+class TweetMappingTests(unittest.TestCase):
+    def test_fxtwitter_fixture(self) -> None:
+        tweet = tweet_data_from_json(FX_TWEET_FIXTURE, status_id="1234567890123456789")
+        self.assertEqual(tweet.tweet_id, "1234567890123456789")
+        self.assertIn("Great article", tweet.text)
+        self.assertEqual(tweet.author_name, "Alice Example")
+        self.assertEqual(tweet.author_handle, "@alice")
+        self.assertIn("https://example.com/article", tweet.urls)
+        self.assertEqual(
+            tweet.photo_urls, ["https://pbs.twimg.com/media/photo1.jpg"]
+        )
+        self.assertFalse(tweet.has_video)
+        self.assertIn("Original take", tweet.quoted_text)
+        self.assertIn("https://quoted.example/post", tweet.quoted_urls)
+        self.assertIn("https://example.com/article", tweet.all_urls)
+
+    def test_fxtwitter_replaces_tco_with_expansion(self) -> None:
+        tweet = tweet_data_from_json(FX_TWEET_FIXTURE, status_id="1")
+        # The shortener is substituted, so it never costs a resolve request later
+        self.assertNotIn("https://t.co/abcd", tweet.urls)
+
+    def test_vxtwitter_fixture(self) -> None:
+        tweet = tweet_data_from_json(VX_TWEET_FIXTURE)
+        self.assertEqual(tweet.tweet_id, "1234567890123456789")
+        self.assertEqual(tweet.author_handle, "@alice")
+        self.assertIn("https://example.com/article", tweet.urls)
+        self.assertEqual(
+            tweet.photo_urls, ["https://pbs.twimg.com/media/photo1.jpg"]
+        )
+        self.assertTrue(tweet.has_video)
+        self.assertIn("Quoted thought", tweet.quoted_text)
+        self.assertIn("https://other.example/page", tweet.quoted_urls)
+
+
+class OpenGraphTests(unittest.TestCase):
+    def test_prefers_og_tags(self) -> None:
+        html = """
+        <html><head>
+          <title>Fallback Title</title>
+          <meta property="og:title" content="OG Title">
+          <meta property="og:description" content="OG Description">
+        </head><body></body></html>
+        """
+        title, description = parse_open_graph(html)
+        self.assertEqual(title, "OG Title")
+        self.assertEqual(description, "OG Description")
+
+    def test_falls_back_to_title_tag(self) -> None:
+        html = "<html><head><title>  Page Title  </title></head></html>"
+        title, description = parse_open_graph(html)
+        self.assertEqual(title, "Page Title")
+        self.assertEqual(description, "")
+
+    def test_skips_x_and_media_hosts(self) -> None:
+        self.assertFalse(should_preview("https://x.com/u/status/1"))
+        self.assertFalse(should_preview("https://twitter.com/u/status/1"))
+        self.assertFalse(should_preview("https://pbs.twimg.com/media/x.jpg"))
+        self.assertFalse(should_preview("https://t.co/abcd"))
+        self.assertTrue(should_preview("https://example.com/article"))
+
+
+class PipelineSkipTests(unittest.TestCase):
+    def test_x_text_only_is_analysable_without_media_files(self) -> None:
+        artifacts = SourceArtifacts(
+            work_dir=Path("."),
+            source_kind=SourceKind.x,
+            title="Hello",
+            description="Hello https://example.com/article",
+            link_previews=[
+                LinkPreview(
+                    url="https://example.com/article",
+                    title="Article",
+                    description="Desc",
+                )
+            ],
+        )
+        self.assertTrue(has_analysable_content(artifacts, "", []))
+
+    def test_tiktok_without_transcript_or_frames_is_skipped(self) -> None:
+        artifacts = SourceArtifacts(
+            work_dir=Path("."),
+            source_kind=SourceKind.tiktok,
+            title="caption",
+            description="caption",
+        )
+        self.assertFalse(has_analysable_content(artifacts, "", []))
+
+
+class PipelineXRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_x_text_only_skips_whisper_and_frames(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                TELEGRAM_BOT_TOKEN="x",
+                OPENROUTER_API_KEY="x",
+                JOB_TMP_DIR=tmp,
+                RESULT_CACHE_SIZE=0,
+            )
+            openrouter = MagicMock()
+            extracted = ExtractionResult(
+                source_url="https://x.com/u/status/1",
+                source_kind=SourceKind.x,
+                title="Hello",
+                creator="@u",
+                summary="A tweet.",
+            )
+            openrouter.extract = AsyncMock(return_value=extracted)
+
+            pipeline = Pipeline(settings, openrouter)
+            artifacts = SourceArtifacts(
+                work_dir=Path(tmp),
+                source_kind=SourceKind.x,
+                title="Hello",
+                creator="@u",
+                description="Hello https://example.com/article",
+                source_id="1",
+                expanded_urls=["https://example.com/article"],
+                link_previews=[
+                    LinkPreview(
+                        url="https://example.com/article",
+                        title="Article",
+                        description="Desc",
+                    )
+                ],
+            )
+            pipeline._download_x = MagicMock(return_value=artifacts)
+            pipeline._download = MagicMock(
+                side_effect=AssertionError("TikTok download should not run")
+            )
+            pipeline._transcribe = MagicMock(
+                side_effect=AssertionError("Whisper should not run")
+            )
+            pipeline._extract_frames = MagicMock(
+                side_effect=AssertionError("ffmpeg frames should not run")
+            )
+
+            result = await pipeline.run("https://x.com/u/status/1")
+
+            openrouter.extract.assert_awaited()
+            kwargs = openrouter.extract.await_args.kwargs
+            self.assertEqual(kwargs["source_kind"], SourceKind.x)
+            self.assertEqual(kwargs["frame_paths"], [])
+            self.assertTrue(kwargs["link_previews"])
+            pipeline._transcribe.assert_not_called()
+            pipeline._extract_frames.assert_not_called()
+            pipeline._download.assert_not_called()
+            self.assertEqual(result.source_kind, SourceKind.x)
+            self.assertEqual(result.title, "Hello")
+
+
+class PostContentTests(unittest.TestCase):
+    def _tweet(self) -> TweetData:
+        return TweetData(
+            tweet_id="1",
+            text="Worth reading https://example.com/article",
+            author_handle="@alice",
+            urls=["https://example.com/article"],
+            photo_urls=["https://pbs.twimg.com/media/a.jpg"],
+            video_urls=["https://video.twimg.com/b.mp4"],
+            has_video=True,
+            quoted_text="Original point",
+        )
+
+    def test_build_keeps_text_links_and_media(self) -> None:
+        previews = [
+            LinkPreview(
+                url="https://example.com/article",
+                title="Article",
+                description="Desc",
+            )
+        ]
+        post = build_post_content(self._tweet(), previews)
+        self.assertIn("Worth reading", post.text)
+        self.assertIn("> Original point", post.text)
+        self.assertEqual(post.links[0].title, "Article")
+        self.assertEqual(len(post.images), 1)
+        self.assertEqual(len(post.videos), 1)
+
+    def test_links_without_previews_are_still_kept(self) -> None:
+        post = build_post_content(self._tweet(), [])
+        self.assertEqual(
+            [link.url for link in post.links], ["https://example.com/article"]
+        )
+        self.assertEqual(post.links[0].title, "")
+
+
+class RawNoteTests(unittest.TestCase):
+    def _result(self, **overrides) -> ExtractionResult:
+        post = overrides.pop(
+            "post",
+            PostContent(
+                text="Worth reading this.",
+                links=[
+                    LinkRef(
+                        url="https://example.com/article",
+                        title="Article",
+                        description="Desc",
+                    )
+                ],
+                media=[
+                    MediaRef(
+                        kind=MediaKind.image,
+                        url="https://pbs.twimg.com/media/a.jpg",
+                    )
+                ],
+            ),
+        )
+        return ExtractionResult(
+            source_url="https://x.com/alice/status/1",
+            source_kind=SourceKind.x,
+            title="Worth reading this.",
+            creator="@alice",
+            post=post,
+            **overrides,
+        )
+
+    def test_note_has_text_links_and_media_sections(self) -> None:
+        md = render_markdown(self._result())
+        self.assertIn("Worth reading this.", md)
+        self.assertIn("## Links", md)
+        self.assertIn("[Article](https://example.com/article)", md)
+        self.assertIn("  - Desc", md)
+        self.assertIn("## Media", md)
+        # No AI sections when nothing was extracted
+        self.assertNotIn("## Items", md)
+        self.assertNotIn("## Recommendation", md)
+
+    def test_note_omits_meaningless_kind_property(self) -> None:
+        md = render_markdown(self._result())
+        self.assertIn("source_kind: x", md)
+        self.assertIn('creator: "@alice"', md)
+        self.assertNotIn("\nkind:", md)
+
+    def test_image_embeds_use_vault_path_when_saved(self) -> None:
+        result = self._result()
+        result.post.media[0].vault_path = "Extracts/attachments/note-1.jpg"
+        md = render_markdown(result)
+        self.assertIn("![[Extracts/attachments/note-1.jpg]]", md)
+        self.assertNotIn("![](https://pbs.twimg.com", md)
+
+    def test_image_falls_back_to_url_before_saving(self) -> None:
+        md = render_markdown(self._result())
+        self.assertIn("![](https://pbs.twimg.com/media/a.jpg)", md)
+
+    def test_saved_video_is_embedded_like_an_image(self) -> None:
+        post = PostContent(
+            media=[
+                MediaRef(
+                    kind=MediaKind.video,
+                    url="https://video.twimg.com/b.mp4",
+                    vault_path="Extracts/attachments/note-1.mp4",
+                )
+            ]
+        )
+        md = render_markdown(self._result(post=post))
+        self.assertIn("![[Extracts/attachments/note-1.mp4]]", md)
+        self.assertNotIn("- [Video]", md)
+
+    def test_unsaved_video_falls_back_to_a_link(self) -> None:
+        post = PostContent(
+            media=[
+                MediaRef(kind=MediaKind.video, url="https://video.twimg.com/b.mp4")
+            ]
+        )
+        md = render_markdown(self._result(post=post))
+        self.assertIn("- [Video](https://video.twimg.com/b.mp4)", md)
+        self.assertNotIn("![[", md)
+
+    def test_preview_lists_links_and_media_counts(self) -> None:
+        preview = format_preview(self._result())
+        self.assertIn("Worth reading this.", preview)
+        self.assertIn("<b>Links</b>", preview)
+        self.assertIn("1 photo attached", preview)
+        self.assertNotIn("Nothing worth looking up", preview)
+
+    @staticmethod
+    def _vault_settings(tmp: str) -> Settings:
+        return Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+            OBSIDIAN_VAULT_PATH=tmp,
+            OBSIDIAN_RELATIVE_DIR="Extracts",
+            ALLOWED_TELEGRAM_USER_IDS="1",
+            PUID=-1,
+            PGID=-1,
+        )
+
+    @staticmethod
+    def _fake_download(url: str, dest: Path, **_kwargs) -> bool:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"media-bytes")
+        return True
+
+    def test_save_downloads_photos_into_vault(self) -> None:
+        result = self._result()
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault_settings(tmp)
+            with unittest.mock.patch(
+                "app.xfetch.download_media", self._fake_download
+            ):
+                path = save_to_obsidian(settings, result)
+
+            attachment = Path(tmp) / "Extracts" / "attachments" / f"{path.stem}-1.jpg"
+            self.assertTrue(attachment.exists())
+            md = path.read_text(encoding="utf-8")
+            self.assertIn(f"![[Extracts/attachments/{path.stem}-1.jpg]]", md)
+
+    def test_save_downloads_videos_into_vault(self) -> None:
+        post = PostContent(
+            media=[
+                MediaRef(
+                    kind=MediaKind.image, url="https://pbs.twimg.com/media/a.png"
+                ),
+                MediaRef(kind=MediaKind.video, url="https://video.twimg.com/b.mp4"),
+                # X serves animated GIFs as mp4, so they save as video too
+                MediaRef(kind=MediaKind.video, url="https://video.twimg.com/c/gif"),
+            ]
+        )
+        result = self._result(post=post)
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault_settings(tmp)
+            with unittest.mock.patch(
+                "app.xfetch.download_media", self._fake_download
+            ):
+                path = save_to_obsidian(settings, result)
+
+            attachments = Path(tmp) / "Extracts" / "attachments"
+            self.assertTrue((attachments / f"{path.stem}-1.png").exists())
+            self.assertTrue((attachments / f"{path.stem}-2.mp4").exists())
+            # No usable extension on the URL, so it still lands as .mp4
+            self.assertTrue((attachments / f"{path.stem}-3.mp4").exists())
+            md = path.read_text(encoding="utf-8")
+            self.assertIn(f"![[Extracts/attachments/{path.stem}-2.mp4]]", md)
+            self.assertNotIn("- [Video]", md)
+
+    def test_oversized_attachment_is_skipped(self) -> None:
+        post = PostContent(
+            media=[MediaRef(kind=MediaKind.video, url="https://video.twimg.com/b.mp4")]
+        )
+        result = self._result(post=post)
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault_settings(tmp)
+            seen: dict[str, int] = {}
+
+            def refuse(url: str, dest: Path, *, max_bytes: int, **_kw) -> bool:
+                seen["max_bytes"] = max_bytes
+                return False
+
+            with unittest.mock.patch("app.xfetch.download_media", refuse):
+                path = save_to_obsidian(settings, result)
+
+            self.assertEqual(seen["max_bytes"], 100 * 1024 * 1024)
+            md = path.read_text(encoding="utf-8")
+            self.assertIn("- [Video](https://video.twimg.com/b.mp4)", md)
+
+    def test_failed_photo_download_leaves_url_embed(self) -> None:
+        result = self._result()
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault_settings(tmp)
+            with unittest.mock.patch(
+                "app.xfetch.download_media", lambda *a, **k: False
+            ):
+                path = save_to_obsidian(settings, result)
+            md = path.read_text(encoding="utf-8")
+            self.assertIn("![](https://pbs.twimg.com/media/a.jpg)", md)
+
+
+class RawPipelineTests(unittest.IsolatedAsyncioTestCase):
+    def _settings(self, tmp: str, use_llm: bool) -> Settings:
+        return Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+            JOB_TMP_DIR=tmp,
+            RESULT_CACHE_SIZE=0,
+            X_USE_LLM=use_llm,
+        )
+
+    async def test_x_skips_the_model_by_default(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(tmp, use_llm=False)
+            self.assertFalse(settings.x_use_llm)
+
+            openrouter = MagicMock()
+            openrouter.extract = AsyncMock(
+                side_effect=AssertionError("model must not be called")
+            )
+            pipeline = Pipeline(settings, openrouter)
+            post = PostContent(text="Hello", links=[LinkRef(url="https://e.com/a")])
+            pipeline._download_x = MagicMock(
+                return_value=SourceArtifacts(
+                    work_dir=Path(tmp),
+                    source_kind=SourceKind.x,
+                    title="Hello",
+                    creator="@u",
+                    source_id="1",
+                    post=post,
+                )
+            )
+
+            result = await pipeline.run("https://x.com/u/status/1")
+
+            openrouter.extract.assert_not_awaited()
+            self.assertTrue(result.is_raw_capture)
+            self.assertEqual(result.post.text, "Hello")
+            self.assertEqual(result.source_kind, SourceKind.x)
+
+    async def test_x_uses_the_model_when_enabled(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(tmp, use_llm=True)
+            openrouter = MagicMock()
+            openrouter.extract = AsyncMock(
+                return_value=ExtractionResult(
+                    source_url="https://x.com/u/status/1",
+                    summary="A tweet.",
+                )
+            )
+            pipeline = Pipeline(settings, openrouter)
+            pipeline._download_x = MagicMock(
+                return_value=SourceArtifacts(
+                    work_dir=Path(tmp),
+                    source_kind=SourceKind.x,
+                    title="Hello",
+                    creator="@u",
+                    description="Hello there",
+                    source_id="1",
+                    post=PostContent(text="Hello there"),
+                )
+            )
+
+            result = await pipeline.run("https://x.com/u/status/1")
+
+            openrouter.extract.assert_awaited()
+            self.assertFalse(result.is_raw_capture)
+            self.assertEqual(result.summary, "A tweet.")
 
 
 if __name__ == "__main__":

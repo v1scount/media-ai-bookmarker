@@ -42,8 +42,24 @@ class Settings(BaseSettings):
         alias="OBSIDIAN_VAULT_PATH",
     )
     obsidian_relative_dir: str = Field(
-        default="TikTok Extracts",
+        default="Extracts",
         alias="OBSIDIAN_RELATIVE_DIR",
+    )
+    # Where post photos are stored. Empty means "attachments" under the notes dir.
+    obsidian_attachments_dir: str = Field(
+        default="",
+        alias="OBSIDIAN_ATTACHMENTS_DIR",
+    )
+
+    # X posts are mostly text and links, so the model earns its cost far less
+    # often than on a TikTok video. Off by default: notes are built locally.
+    x_use_llm: bool = Field(default=False, alias="X_USE_LLM")
+    # Per-file ceiling for photos and videos copied into the vault
+    max_attachment_mb: int = Field(
+        default=100,
+        alias="MAX_ATTACHMENT_MB",
+        ge=1,
+        le=2000,
     )
 
     # Stored as a plain string so empty / comma-separated env values work.
@@ -128,7 +144,7 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("obsidian_relative_dir", mode="before")
+    @field_validator("obsidian_relative_dir", "obsidian_attachments_dir", mode="before")
     @classmethod
     def strip_relative_dir(cls, value: object) -> object:
         if isinstance(value, str):
@@ -144,6 +160,22 @@ class Settings(BaseSettings):
     @property
     def notes_dir(self) -> Path:
         return self.obsidian_vault_path / self.obsidian_relative_dir
+
+    @property
+    def attachments_relative_dir(self) -> str:
+        """Vault-relative folder for saved photos, used to build embed links."""
+        if self.obsidian_attachments_dir:
+            return self.obsidian_attachments_dir.replace("\\", "/").strip("/")
+        base = self.obsidian_relative_dir.replace("\\", "/").strip("/")
+        return f"{base}/attachments" if base else "attachments"
+
+    @property
+    def attachments_dir(self) -> Path:
+        return self.obsidian_vault_path / self.attachments_relative_dir
+
+    @property
+    def max_attachment_bytes(self) -> int:
+        return self.max_attachment_mb * 1024 * 1024
 
 
 @lru_cache
