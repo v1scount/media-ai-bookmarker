@@ -1,0 +1,9 @@
+python-telegram-bot==21.10
+# yt-dlp is reinstalled from GitHub master in the Dockerfile for TikTok fixes
+yt-dlp>=2025.1.15
+faster-whisper>=1.1.0
+httpx>=0.28.0
+# Used to drop near-duplicate frames before they cost image tokens
+pillow>=11.0.0
+pydantic>=2.10.0
+pydantic-settings>=2.7.0

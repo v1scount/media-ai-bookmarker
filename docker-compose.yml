@@ -1,0 +1,27 @@
+services:
+  bot:
+    build: .
+    container_name: tiktok-extractor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Host Obsidian vault → container /vault
+      - "${OBSIDIAN_VAULT_PATH}:/vault"
+      # Persist Whisper model downloads across restarts
+      - whisper-models:/models
+      # Job temp media (cleared per job; volume helps if /tmp is tiny)
+      - job-tmp:/tmp/tiktok-jobs
+      # Optional Netscape cookies.txt for TikTok (export from browser)
+      - ./cookies.txt:/config/cookies.txt:ro
+    environment:
+      OBSIDIAN_VAULT_PATH: /vault
+      WHISPER_DOWNLOAD_ROOT: /models
+      JOB_TMP_DIR: /tmp/tiktok-jobs
+      YTDLP_COOKIES_FILE: /config/cookies.txt
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+
+volumes:
+  whisper-models:
+  job-tmp:
