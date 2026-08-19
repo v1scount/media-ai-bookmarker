@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 
 from app.config import get_settings
-from app.models import ExtractionResult, extract_tiktok_url
+from app.models import ExtractionResult, extract_supported_url
 from app.obsidian import relative_vault_path, save_to_obsidian
 from app.openrouter import OpenRouterClient
 from app.pipeline import Pipeline, format_preview
@@ -88,8 +88,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("You are not authorized to use this bot.")
         return
     await update.message.reply_text(
-        "Send me a TikTok link. I'll extract tools, books, movies, and music "
-        "recommendations, then let you save a Markdown note to Obsidian."
+        "Send me a TikTok or X (Twitter) link. I'll extract tools, books, movies, "
+        "and music recommendations, then let you save a Markdown note to Obsidian."
     )
 
 
@@ -112,16 +112,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text("You are not authorized to use this bot.")
         return
 
-    url = extract_tiktok_url(message.text)
-    if not url:
+    match = extract_supported_url(message.text)
+    if not match:
         await message.reply_text(
-            "Send a TikTok URL (tiktok.com or vm.tiktok.com)."
+            "Send a TikTok URL (tiktok.com, vm.tiktok.com) or an X post URL "
+            "(x.com/…/status/…)."
         )
         return
+    _kind, url = match
 
     job_lock: asyncio.Lock = context.application.bot_data["job_lock"]
     if job_lock.locked():
-        await message.reply_text("Busy with another video — try again in a moment.")
+        await message.reply_text("Busy with another job — try again in a moment.")
         return
 
     status = await message.reply_text("Queued…")
@@ -146,13 +148,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             result = await pipeline.run(url, progress_cb=progress_cb)
         except asyncio.TimeoutError:
             await status.edit_text(
-                "Timed out while processing this video. Try again or pick a shorter clip."
+                "Timed out while processing this link. Try again or pick a shorter clip."
             )
             return
         except Exception as exc:
             logger.exception("Pipeline failed for %s", url)
             err = str(exc)[:300] or type(exc).__name__
-            await status.edit_text(f"Failed to process video:\n{err}")
+            await status.edit_text(f"Failed to process link:\n{err}")
             return
 
     result_id = await _store_result(result)

@@ -11,18 +11,22 @@ from typing import Any
 import httpx
 
 from app.config import Settings
-from app.models import ExtractionResult
+from app.models import ExtractionResult, SourceKind
+from app.xfetch import LinkPreview
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You identify things worth looking up later from TikTok videos.
+SYSTEM_PROMPT = """You identify things worth looking up later from TikTok videos
+and X (Twitter) posts.
 
-You receive:
-- Video metadata (title/caption, creator, description with hashtags)
+You receive some of:
+- Metadata (title/caption, creator, description or post text with hashtags)
 - An ephemeral spoken transcript (do NOT quote it back or include a transcript field)
-- Sampled video frames (use them for on-screen text, titles, covers, logos)
+- Images: sampled video frames or post photos (use them for on-screen text,
+  titles, covers, logos)
+- linked_pages: URLs the post links to, with the title and description of each
 
-Always answer in English, even when the video is in another language. Keep proper
+Always answer in English, even when the source is in another language. Keep proper
 names, titles, and handles in their original spelling.
 
 What counts as an item: tools and apps, physical products, books, movies, series,
@@ -30,19 +34,21 @@ music albums, YouTube videos or channels, podcasts, courses, articles, places,
 recipes. Skip filler, jokes, generic advice, and unrelated chatter.
 
 How thorough to be:
-- If the video is a list or roundup ("5 apps I use", "my favourite books"), set
+- If the source is a list or roundup ("5 apps I use", "my favourite books"), set
   video_kind to "list" and capture every item mentioned, each with short notes.
-- If the video is about a single thing, set video_kind to "single", return that one
+- If the source is about a single thing, set video_kind to "single", return that one
   item with is_main_topic true, and put the useful detail in its notes.
-- Set is_main_topic true only for what the video is actually about, not passing mentions.
+- Set is_main_topic true only for what the source is actually about, not passing mentions.
+- When a post is mostly a link, the linked page is usually the main topic.
 
 Naming and links:
 - Give the exact name. Put the author, artist, band, studio, or channel in creator_or_author.
-- suggested_link only for a URL you are confident is correct (official site, store page,
-  YouTube link stated in the video). Otherwise null - do not guess, a plain web search
-  is added automatically.
+- suggested_link only for a URL you are confident is correct: prefer a URL given to
+  you in linked_pages, an official site, a store page, or a link stated in the source.
+  Otherwise null - never guess a URL, a plain web search is added automatically.
 - confidence reflects how sure you are the name is right: "high" when it is stated
-  clearly or shown on screen, "low" when you are inferring it.
+  clearly, shown on screen, or taken from a linked page title, "low" when you are
+  inferring it.
 
 Other rules:
 - Never include a full transcript or raw OCR dump.
@@ -116,7 +122,7 @@ ENTITY_SCHEMA: dict[str, Any] = {
         "is_main_topic": {
             "type": "boolean",
             "description": (
-                "True only if the video is primarily about this item."
+                "True only if the video or post is primarily about this item."
             ),
         },
         "confidence": {
@@ -138,7 +144,7 @@ ENTITY_SCHEMA: dict[str, Any] = {
 }
 
 RESULT_JSON_SCHEMA: dict[str, Any] = {
-    "name": "tiktok_extraction",
+    "name": "media_extraction",
     "strict": True,
     "schema": {
         "type": "object",
@@ -149,14 +155,14 @@ RESULT_JSON_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "One to three sentences in English describing what the video "
-                    "recommends and who it is useful for."
+                    "or post recommends and who it is useful for."
                 ),
             },
             "video_kind": {
                 "type": "string",
                 "description": (
                     "'list' for roundups covering several items, 'single' when the "
-                    "video is about one thing, 'other' otherwise."
+                    "video or post is about one thing, 'other' otherwise."
                 ),
                 "enum": ["single", "list", "other"],
             },
@@ -196,6 +202,53 @@ def _image_data_url(path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def build_user_prompt(
+    *,
+    source_kind: SourceKind,
+    title: str,
+    creator: str,
+    description: str,
+    transcript: str,
+    link_previews: list[LinkPreview],
+) -> str:
+    """The text block sent alongside the images, tailored to the source."""
+    if source_kind == SourceKind.x:
+        lines = [
+            "source: X (Twitter) post",
+            f"author: {creator}",
+            "",
+            "post_text:",
+            description or "(none)",
+        ]
+    else:
+        lines = [
+            "source: TikTok video",
+            f"title: {title}",
+            f"creator: {creator}",
+            f"description: {description}",
+        ]
+
+    if link_previews:
+        lines.extend(
+            ["", "linked_pages (confirmed URLs, safe to use as suggested_link):"]
+        )
+        for preview in link_previews:
+            lines.append(f"- url: {preview.url}")
+            if preview.title:
+                lines.append(f"  title: {preview.title}")
+            if preview.description:
+                lines.append(f"  description: {preview.description}")
+
+    lines.extend(
+        [
+            "",
+            "spoken_transcript (ephemeral, do not echo):",
+            transcript or "(none)",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _strip_code_fence(text: str) -> str:
     text = text.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL | re.IGNORECASE)
@@ -209,6 +262,7 @@ def _parse_result(raw: str, source_url: str) -> ExtractionResult:
     data = json.loads(cleaned)
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object")
+    data.pop("source_kind", None)
     data["source_url"] = source_url
     return ExtractionResult.model_validate(data)
 
@@ -270,6 +324,8 @@ class OpenRouterClient:
         description: str,
         transcript: str,
         frame_paths: list[Path],
+        link_previews: list[LinkPreview] | None = None,
+        source_kind: SourceKind = SourceKind.tiktok,
     ) -> ExtractionResult:
         settings = self._settings
         description = truncate_text(
@@ -282,12 +338,13 @@ class OpenRouterClient:
         content: list[dict[str, Any]] = [
             {
                 "type": "text",
-                "text": (
-                    f"title: {title}\n"
-                    f"creator: {creator}\n"
-                    f"description: {description}\n\n"
-                    f"spoken_transcript (ephemeral, do not echo):\n"
-                    f"{transcript or '(none)'}"
+                "text": build_user_prompt(
+                    source_kind=source_kind,
+                    title=title,
+                    creator=creator,
+                    description=description,
+                    transcript=transcript,
+                    link_previews=link_previews or [],
                 ),
             }
         ]
