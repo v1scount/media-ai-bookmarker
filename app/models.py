@@ -37,7 +37,7 @@ X_STATUS_ID_RE = re.compile(r"/status(?:es)?/(\d+)", re.IGNORECASE)
 
 TRAILING_PUNCTUATION = ").,];>"
 
-SEARCH_URL_TEMPLATE = "https://www.google.com/search?q={query}"
+SEARCH_URL_TEMPLATE = "https://kagi.com/search?q={query}"
 
 
 class SourceKind(str, Enum):
@@ -187,11 +187,15 @@ class Entity(BaseModel):
         return value
 
     @property
+    def search_query(self) -> str:
+        """Local search string: name, author, and a type hint. No LLM involved."""
+        parts = [self.name, self.creator_or_author, SEARCH_HINTS.get(self.type, "")]
+        return " ".join(part for part in parts if part).strip()
+
+    @property
     def search_url(self) -> str:
         """Plain web search for this item, built locally (no LLM research)."""
-        parts = [self.name, self.creator_or_author, SEARCH_HINTS.get(self.type, "")]
-        query = " ".join(part for part in parts if part).strip()
-        return SEARCH_URL_TEMPLATE.format(query=quote_plus(query))
+        return SEARCH_URL_TEMPLATE.format(query=quote_plus(self.search_query))
 
 
 class MediaKind(str, Enum):

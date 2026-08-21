@@ -36,6 +36,8 @@ cp .env.example .env
 | `X_USE_LLM` | `false` (default) saves X posts verbatim; `true` sends them to the model |
 | `ALLOWED_TELEGRAM_USER_IDS` | Your numeric Telegram user id |
 | `PUID` / `PGID` | Host uid/gid that owns the vault (`id -u` / `id -g`). Required so notes are not root-owned |
+| `KAGI_API_KEY` | Optional. From [kagi.com/api/keys](https://kagi.com/api/keys). Empty = search links only |
+| `KAGI_SEARCH_PER_JOB` | Max Kagi API searches per video (default `3`; `0` disables the API) |
 
 3. Discover your Telegram user id: message the bot with `/whoami` (no allowlist needed), or use [@userinfobot](https://t.me/userinfobot). Put that number in `ALLOWED_TELEGRAM_USER_IDS`.
 
@@ -142,8 +144,15 @@ Notes on behaviour:
   post with links stripped; the model never rewrites it.
 - `suggested_link` is only filled when the model is confident. For X posts the
   expanded links are handed to the model, so they can be used verbatim. Otherwise the note
-  gets a plain web search link built locally from the name and author, so nothing
-  is ever guessed and no research tokens are spent.
+  gets a [Kagi](https://kagi.com) search link built locally from the name and author, so
+  nothing is ever guessed and no research tokens are spent. Clicking that link uses your
+  unlimited Kagi subscription in the browser.
+- If `KAGI_API_KEY` is set, the bot also calls the [Kagi Search API](https://help.kagi.com/kagi/api/search.html)
+  for up to `KAGI_SEARCH_PER_JOB` items (default 3; skips low-confidence and items that
+  already have a link). A hit becomes `[link](the top result)` so the note opens that page
+  directly. API failures fall back to the Kagi search link. This is billed separately
+  ([~$12 / 1k searches](https://kagi.com/api/pricing); a $5 monthly credit is ~416 calls).
+  `docker compose logs bot | grep kagi` shows each lookup.
 - Items marked low confidence render as `_(uncertain)_`.
 - List videos render every item under `## Items`; single-topic videos lead with
   `## Recommendation` and push passing mentions to `## Also mentioned`.
@@ -159,8 +168,9 @@ Notes on behaviour:
 4. When there is video: `ffmpeg` → mono 16 kHz WAV for Whisper; sample ~8 JPEG frames
 5. `faster-whisper` `base` (CPU int8) → transcript kept **in memory only**
 6. OpenRouter multimodal → structured JSON (tools / books / movies / music)
-7. Always delete temp job directory
-8. Telegram preview + save keyboard; photos are fetched into the vault on save
+7. Optional: Kagi Search API fills a few missing item URLs (skipped without `KAGI_API_KEY`)
+8. Always delete temp job directory
+9. Telegram preview + save keyboard; photos are fetched into the vault on save
 
 ## Token cost controls
 
@@ -182,7 +192,8 @@ as possible and to avoid requests that would fail:
   never uploaded to a text-only model.
 
 Per-request token usage is logged, so `docker compose logs bot | grep usage`
-shows what each video actually cost.
+shows what each video actually cost. Kagi API lookups are logged separately:
+`docker compose logs bot | grep kagi`.
 
 ## Security
 
@@ -199,6 +210,7 @@ app/
   xfetch.py       X post metadata, photo downloads, Open Graph link previews
   frames.py       Near-duplicate frame dropping (saves image tokens)
   openrouter.py   Multimodal extraction client
+  kagi.py         Optional Kagi Search API client (direct page URLs)
   obsidian.py     Markdown renderer + atomic vault write
   config.py       Settings from env
   models.py       Schema + URL parsing
