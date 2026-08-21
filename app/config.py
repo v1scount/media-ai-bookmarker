@@ -129,6 +129,21 @@ class Settings(BaseSettings):
         default=120.0,
         alias="OPENROUTER_TIMEOUT_SECONDS",
     )
+    # Optional. Empty = Kagi search links only (unlimited browser searches).
+    # Set to spend API credit resolving a few items to a direct page URL.
+    kagi_api_key: str = Field(default="", alias="KAGI_API_KEY")
+    kagi_search_per_job: int = Field(
+        default=3,
+        alias="KAGI_SEARCH_PER_JOB",
+        ge=0,
+        le=12,
+    )
+    kagi_timeout_seconds: float = Field(
+        default=15.0,
+        alias="KAGI_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=60.0,
+    )
     ytdlp_cookies_file: Path | None = Field(
         default=None,
         alias="YTDLP_COOKIES_FILE",
@@ -136,6 +151,13 @@ class Settings(BaseSettings):
     # Host user/group so vault notes are visible to Obsidian (not root-owned)
     puid: int = Field(default=1000, alias="PUID")
     pgid: int = Field(default=1000, alias="PGID")
+
+    @field_validator("kagi_api_key", mode="before")
+    @classmethod
+    def strip_kagi_key(cls, value: object) -> object:
+        if value is None:
+            return ""
+        return str(value).strip()
 
     @field_validator("ytdlp_cookies_file", mode="before")
     @classmethod

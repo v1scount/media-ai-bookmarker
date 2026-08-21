@@ -18,6 +18,7 @@ from telegram.ext import (
 )
 
 from app.config import get_settings
+from app.kagi import KagiClient
 from app.models import ExtractionResult, extract_supported_url
 from app.obsidian import relative_vault_path, save_to_obsidian
 from app.openrouter import OpenRouterClient
@@ -244,9 +245,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def post_init(application: Application) -> None:
     settings = get_settings()
     openrouter = OpenRouterClient(settings)
-    pipeline = Pipeline(settings, openrouter)
+    kagi = KagiClient(settings)
+    pipeline = Pipeline(settings, openrouter, kagi)
     application.bot_data["settings"] = settings
     application.bot_data["openrouter"] = openrouter
+    application.bot_data["kagi"] = kagi
     application.bot_data["pipeline"] = pipeline
     application.bot_data["job_lock"] = asyncio.Lock()
     # Checked once so we never upload frames to a text-only model
@@ -271,6 +274,9 @@ async def post_shutdown(application: Application) -> None:
     openrouter: OpenRouterClient | None = application.bot_data.get("openrouter")
     if openrouter:
         await openrouter.aclose()
+    kagi: KagiClient | None = application.bot_data.get("kagi")
+    if kagi:
+        await kagi.aclose()
 
 
 def main() -> None:

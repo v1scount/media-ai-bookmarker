@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.config import Settings
+from app.kagi import KagiClient, select_kagi_candidates
 from app.models import (
     ExtractionResult,
     LinkRef,
@@ -50,9 +51,15 @@ class SourceArtifacts:
 
 
 class Pipeline:
-    def __init__(self, settings: Settings, openrouter: OpenRouterClient) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        openrouter: OpenRouterClient,
+        kagi: KagiClient | None = None,
+    ) -> None:
         self.settings = settings
         self.openrouter = openrouter
+        self.kagi = kagi
         self._whisper_model = None
         self._cache: OrderedDict[str, ExtractionResult] = OrderedDict()
         self.model_supports_images = True
@@ -209,10 +216,30 @@ class Pipeline:
         result.title = artifacts.title
         result.creator = artifacts.creator
 
+        await self._enrich_with_kagi(result, progress)
+
         self._cache_put(url, result)
         if source_key:
             self._cache_put(source_key, result)
         return result
+
+    async def _enrich_with_kagi(self, result: ExtractionResult, progress) -> None:
+        """Fill a few missing suggested_link values from Kagi. Failures are ignored."""
+        kagi = self.kagi
+        if kagi is None or not kagi.enabled or not result.entities:
+            return
+        candidates = select_kagi_candidates(
+            result.entities, self.settings.kagi_search_per_job
+        )
+        if not candidates:
+            return
+        await progress("Looking up items on Kagi…")
+        urls = await asyncio.gather(
+            *(kagi.top_url(entity.search_query) for entity in candidates)
+        )
+        for entity, url in zip(candidates, urls):
+            if url:
+                entity.suggested_link = url
 
     def _uses_llm(self, kind: SourceKind) -> bool:
         """TikTok always needs the model; X only when explicitly enabled."""

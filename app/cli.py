@@ -15,6 +15,7 @@ import logging
 import sys
 
 from app.config import get_settings
+from app.kagi import KagiClient
 from app.models import extract_supported_url
 from app.obsidian import relative_vault_path, save_to_obsidian
 from app.openrouter import OpenRouterClient
@@ -29,7 +30,8 @@ logging.basicConfig(
 async def _run(url: str, save: bool) -> int:
     settings = get_settings()
     openrouter = OpenRouterClient(settings)
-    pipeline = Pipeline(settings, openrouter)
+    kagi = KagiClient(settings)
+    pipeline = Pipeline(settings, openrouter, kagi)
     try:
         pipeline.model_supports_images = await openrouter.verify_model()
 
@@ -48,6 +50,7 @@ async def _run(url: str, save: bool) -> int:
         return 0
     finally:
         await openrouter.aclose()
+        await kagi.aclose()
 
 
 def main(argv: list[str] | None = None) -> int:

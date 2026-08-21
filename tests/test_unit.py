@@ -7,9 +7,17 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+import httpx
+
 from app.config import Settings, _parse_user_ids
 from app.download import _usable_cookies, pick_media_files
 from app.frames import dedupe_frames, hamming_distance
+from app.kagi import (
+    KagiClient,
+    authorization_header,
+    select_kagi_candidates,
+    top_result_url,
+)
 from app.models import (
     Confidence,
     Entity,
@@ -84,6 +92,15 @@ class AllowedIdsTests(unittest.TestCase):
             ALLOWED_TELEGRAM_USER_IDS="42",
         )
         self.assertEqual(settings.allowed_telegram_user_ids, [42])
+
+    def test_kagi_defaults_are_links_only(self) -> None:
+        settings = Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+        )
+        self.assertEqual(settings.kagi_api_key, "")
+        self.assertEqual(settings.kagi_search_per_job, 3)
+        self.assertEqual(settings.kagi_timeout_seconds, 15.0)
 
 
 class UrlParseTests(unittest.TestCase):
@@ -253,8 +270,9 @@ class ExtractionSchemaTests(unittest.TestCase):
         )
         self.assertEqual(
             entity.search_url,
-            "https://www.google.com/search?q=Dune+Frank+Herbert+book",
+            "https://kagi.com/search?q=Dune+Frank+Herbert+book",
         )
+        self.assertEqual(entity.search_query, "Dune Frank Herbert book")
 
     def test_main_topic_sorted_first(self) -> None:
         result = ExtractionResult.model_validate(
@@ -397,7 +415,7 @@ class ObsidianTests(unittest.TestCase):
         self.assertIn("kind: single", md)
         self.assertIn("## Recommendation", md)
         self.assertIn("## Also mentioned", md)
-        self.assertIn("[search](https://www.google.com/search?q=Dune+", md)
+        self.assertIn("[search](https://kagi.com/search?q=Dune+", md)
 
     def test_low_confidence_marked(self) -> None:
         result = ExtractionResult(
@@ -1009,6 +1027,271 @@ class RawPipelineTests(unittest.IsolatedAsyncioTestCase):
             openrouter.extract.assert_awaited()
             self.assertFalse(result.is_raw_capture)
             self.assertEqual(result.summary, "A tweet.")
+
+
+class KagiClientTests(unittest.TestCase):
+    def test_authorization_adds_bot_prefix(self) -> None:
+        self.assertEqual(authorization_header("abc"), "Bot abc")
+
+    def test_authorization_keeps_existing_prefix(self) -> None:
+        self.assertEqual(authorization_header("Bot abc"), "Bot abc")
+        self.assertEqual(authorization_header("Bearer abc"), "Bearer abc")
+
+    def test_v1_payload_uses_first_search_url(self) -> None:
+        payload = {
+            "data": {
+                "search": [
+                    {"url": "https://en.wikipedia.org/wiki/Dune_(novel)", "title": "Dune"},
+                    {"url": "https://example.com/other", "title": "Other"},
+                ]
+            }
+        }
+        self.assertEqual(
+            top_result_url(payload),
+            "https://en.wikipedia.org/wiki/Dune_(novel)",
+        )
+
+    def test_legacy_payload_uses_first_t0_url(self) -> None:
+        payload = {
+            "data": [
+                {"t": 1, "list": ["related"]},
+                {
+                    "t": 0,
+                    "url": "https://en.wikipedia.org/wiki/Steve_Jobs",
+                    "title": "Steve Jobs",
+                },
+            ]
+        }
+        self.assertEqual(
+            top_result_url(payload),
+            "https://en.wikipedia.org/wiki/Steve_Jobs",
+        )
+
+    def test_empty_or_invalid_payload_is_none(self) -> None:
+        self.assertIsNone(top_result_url(None))
+        self.assertIsNone(top_result_url({}))
+        self.assertIsNone(top_result_url({"data": {"search": []}}))
+        self.assertIsNone(top_result_url({"data": [{"t": 1, "list": ["x"]}]}))
+        self.assertIsNone(top_result_url({"data": {"search": [{"url": "not-a-url"}]}}))
+
+    def test_candidates_skip_linked_and_low_confidence(self) -> None:
+        already = Entity(
+            name="Linked",
+            suggested_link="https://example.com",
+            confidence=Confidence.high,
+        )
+        low = Entity(name="Guess", confidence=Confidence.low)
+        main = Entity(
+            name="Main",
+            is_main_topic=True,
+            confidence=Confidence.medium,
+        )
+        side = Entity(name="Side", confidence=Confidence.high)
+        picked = select_kagi_candidates([already, low, side, main], limit=3)
+        self.assertEqual([entity.name for entity in picked], ["Main", "Side"])
+
+    def test_candidates_respect_cap_and_zero(self) -> None:
+        items = [
+            Entity(name="A", is_main_topic=True, confidence=Confidence.high),
+            Entity(name="B", confidence=Confidence.high),
+            Entity(name="C", confidence=Confidence.medium),
+        ]
+        self.assertEqual(
+            [entity.name for entity in select_kagi_candidates(items, 2)],
+            ["A", "B"],
+        )
+        self.assertEqual(select_kagi_candidates(items, 0), [])
+
+
+class KagiHttpTests(unittest.IsolatedAsyncioTestCase):
+    def _settings(self, **overrides: object) -> Settings:
+        values: dict[str, object] = {
+            "TELEGRAM_BOT_TOKEN": "x",
+            "OPENROUTER_API_KEY": "x",
+            "KAGI_API_KEY": "secret",
+        }
+        values.update(overrides)
+        return Settings(**values)
+
+    async def test_top_url_parses_v1_and_caches(self) -> None:
+        client = KagiClient(self._settings())
+        calls = {"n": 0}
+
+        async def fake_post(*_args, **_kwargs):
+            calls["n"] += 1
+            request = httpx.Request("POST", "https://kagi.com/api/v1/search")
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "search": [
+                            {"url": "https://en.wikipedia.org/wiki/Dune_(novel)"}
+                        ]
+                    }
+                },
+                request=request,
+            )
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            url = await client.top_url("Dune Frank Herbert book")
+            again = await client.top_url("Dune Frank Herbert book")
+        finally:
+            await client.aclose()
+        self.assertEqual(url, "https://en.wikipedia.org/wiki/Dune_(novel)")
+        self.assertEqual(again, url)
+        self.assertEqual(calls["n"], 1)
+
+    async def test_http_error_returns_none(self) -> None:
+        client = KagiClient(self._settings())
+
+        async def fake_post(*_args, **_kwargs):
+            request = httpx.Request("POST", "https://kagi.com/api/v1/search")
+            return httpx.Response(402, text="no credit", request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            url = await client.top_url("Dune")
+        finally:
+            await client.aclose()
+        self.assertIsNone(url)
+
+    async def test_disabled_without_key(self) -> None:
+        client = KagiClient(self._settings(KAGI_API_KEY=""))
+        self.assertFalse(client.enabled)
+        try:
+            self.assertIsNone(await client.top_url("Dune"))
+        finally:
+            await client.aclose()
+
+    async def test_disabled_when_per_job_is_zero(self) -> None:
+        client = KagiClient(self._settings(KAGI_SEARCH_PER_JOB=0))
+        self.assertFalse(client.enabled)
+        try:
+            self.assertIsNone(await client.top_url("Dune"))
+        finally:
+            await client.aclose()
+
+
+class KagiEnrichmentTests(unittest.IsolatedAsyncioTestCase):
+    def _settings(self, tmp: str) -> Settings:
+        return Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+            KAGI_API_KEY="secret",
+            JOB_TMP_DIR=tmp,
+            RESULT_CACHE_SIZE=0,
+        )
+
+    def _artifacts(self, tmp: str) -> SourceArtifacts:
+        return SourceArtifacts(
+            work_dir=Path(tmp),
+            source_kind=SourceKind.x,
+            title="Hello",
+            creator="@u",
+            description="Hello https://example.com/article",
+            source_id="1",
+            link_previews=[
+                LinkPreview(
+                    url="https://example.com/article",
+                    title="Article",
+                    description="Desc",
+                )
+            ],
+        )
+
+    async def test_fills_suggested_link_from_kagi(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(tmp)
+            openrouter = MagicMock()
+            openrouter.extract = AsyncMock(
+                return_value=ExtractionResult(
+                    source_url="https://x.com/u/status/1",
+                    entities=[
+                        Entity(
+                            type=EntityType.book,
+                            name="Dune",
+                            creator_or_author="Frank Herbert",
+                            is_main_topic=True,
+                            confidence=Confidence.high,
+                        ),
+                        Entity(
+                            name="Kindle",
+                            type=EntityType.tool,
+                            confidence=Confidence.low,
+                        ),
+                        Entity(
+                            name="Goodreads",
+                            suggested_link="https://www.goodreads.com/book/show/1",
+                            confidence=Confidence.high,
+                        ),
+                    ],
+                )
+            )
+            kagi = MagicMock()
+            kagi.enabled = True
+            kagi.top_url = AsyncMock(
+                return_value="https://en.wikipedia.org/wiki/Dune_(novel)"
+            )
+            pipeline = Pipeline(settings, openrouter, kagi)
+            pipeline._download_x = MagicMock(return_value=self._artifacts(tmp))
+
+            result = await pipeline.run("https://x.com/u/status/1")
+
+            kagi.top_url.assert_awaited_once_with("Dune Frank Herbert book")
+            dune = next(entity for entity in result.entities if entity.name == "Dune")
+            kindle = next(entity for entity in result.entities if entity.name == "Kindle")
+            goodreads = next(
+                entity for entity in result.entities if entity.name == "Goodreads"
+            )
+            self.assertEqual(
+                dune.suggested_link, "https://en.wikipedia.org/wiki/Dune_(novel)"
+            )
+            self.assertIsNone(kindle.suggested_link)
+            self.assertEqual(
+                goodreads.suggested_link, "https://www.goodreads.com/book/show/1"
+            )
+            preview = format_preview(result)
+            self.assertIn("en.wikipedia.org/wiki/Dune", preview)
+            md = render_markdown(result)
+            self.assertIn("[link](https://en.wikipedia.org/wiki/Dune_(novel))", md)
+            self.assertIn("[search](https://kagi.com/search?q=Kindle", md)
+
+    async def test_api_failure_leaves_kagi_search_url(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(tmp)
+            openrouter = MagicMock()
+            openrouter.extract = AsyncMock(
+                return_value=ExtractionResult(
+                    source_url="https://x.com/u/status/1",
+                    entities=[
+                        Entity(
+                            name="Dune",
+                            type=EntityType.book,
+                            creator_or_author="Frank Herbert",
+                            confidence=Confidence.high,
+                        )
+                    ],
+                )
+            )
+            kagi = MagicMock()
+            kagi.enabled = True
+            kagi.top_url = AsyncMock(return_value=None)
+            pipeline = Pipeline(settings, openrouter, kagi)
+            pipeline._download_x = MagicMock(return_value=self._artifacts(tmp))
+
+            result = await pipeline.run("https://x.com/u/status/1")
+
+            self.assertIsNone(result.entities[0].suggested_link)
+            self.assertTrue(
+                result.entities[0].search_url.startswith("https://kagi.com/search?q=")
+            )
+            md = render_markdown(result)
+            self.assertIn("[search](https://kagi.com/search?q=", md)
 
 
 if __name__ == "__main__":
