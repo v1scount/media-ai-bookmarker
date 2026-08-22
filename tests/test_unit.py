@@ -1294,5 +1294,525 @@ class KagiEnrichmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("[search](https://kagi.com/search?q=", md)
 
 
+class HardcoverHelperTests(unittest.TestCase):
+    def test_authorization_adds_bearer_prefix(self) -> None:
+        from app.hardcover import authorization_header
+
+        self.assertEqual(authorization_header("abc"), "Bearer abc")
+
+    def test_authorization_keeps_existing_prefix(self) -> None:
+        from app.hardcover import authorization_header
+
+        self.assertEqual(authorization_header("Bearer abc"), "Bearer abc")
+        self.assertEqual(authorization_header("bearer abc"), "bearer abc")
+
+    def test_search_query_omits_book_hint(self) -> None:
+        from app.hardcover import hardcover_search_query
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Dune",
+            creator_or_author="Frank Herbert",
+        )
+        self.assertEqual(hardcover_search_query(entity), "Dune Frank Herbert")
+
+    def test_parse_search_hits_from_dict(self) -> None:
+        from app.hardcover import parse_search_hits
+
+        hits = parse_search_hits(
+            {
+                "hits": [
+                    {
+                        "document": {
+                            "id": "401",
+                            "title": "Dune",
+                            "author_names": ["Frank Herbert"],
+                            "slug": "dune",
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].book_id, 401)
+        self.assertEqual(hits[0].title, "Dune")
+        self.assertEqual(hits[0].author_names, ["Frank Herbert"])
+        self.assertEqual(hits[0].slug, "dune")
+        self.assertEqual(hits[0].url, "https://hardcover.app/books/dune")
+
+    def test_parse_search_hits_from_json_string(self) -> None:
+        from app.hardcover import parse_search_hits
+
+        hits = parse_search_hits(
+            '{"hits":[{"document":{"id":7,"title":"Neuromancer",'
+            '"author_names":["William Gibson"],"slug":"neuromancer"}}]}'
+        )
+        self.assertEqual(hits[0].book_id, 7)
+        self.assertEqual(hits[0].slug, "neuromancer")
+
+    def test_parse_search_hits_ignores_invalid(self) -> None:
+        from app.hardcover import parse_search_hits
+
+        self.assertEqual(parse_search_hits(None), [])
+        self.assertEqual(parse_search_hits({}), [])
+        self.assertEqual(parse_search_hits("not-json"), [])
+        self.assertEqual(parse_search_hits({"hits": [{"document": {"title": "x"}}]}), [])
+
+    def test_pick_match_accepts_title_and_author(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Dune",
+            creator_or_author="Frank Herbert",
+        )
+        hits = [
+            HardcoverHit(
+                book_id=2,
+                title="Dune Messiah",
+                author_names=["Frank Herbert"],
+                slug="dune-messiah",
+            ),
+            HardcoverHit(
+                book_id=1,
+                title="Dune",
+                author_names=["Frank Herbert"],
+                slug="dune",
+            ),
+        ]
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, 1)
+
+    def test_pick_match_rejects_sequel_and_wrong_author(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        dune = Entity(
+            type=EntityType.book,
+            name="Dune",
+            creator_or_author="Frank Herbert",
+        )
+        sequel_only = [
+            HardcoverHit(
+                book_id=2,
+                title="Dune Messiah",
+                author_names=["Frank Herbert"],
+                slug="dune-messiah",
+            )
+        ]
+        self.assertIsNone(pick_match(dune, sequel_only))
+
+        wrong_author = [
+            HardcoverHit(
+                book_id=9,
+                title="Dune",
+                author_names=["Someone Else"],
+                slug="dune-else",
+            )
+        ]
+        self.assertIsNone(pick_match(dune, wrong_author))
+
+    def test_pick_match_skips_author_check_when_extract_has_none(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        entity = Entity(type=EntityType.book, name="Dune")
+        hits = [
+            HardcoverHit(
+                book_id=1,
+                title="Dune",
+                author_names=["Frank Herbert"],
+                slug="dune",
+            )
+        ]
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, 1)
+
+    def test_candidates_books_only_skip_low_confidence(self) -> None:
+        from app.hardcover import select_hardcover_candidates
+
+        already_low = Entity(
+            type=EntityType.book,
+            name="Guess",
+            confidence=Confidence.low,
+        )
+        tool = Entity(type=EntityType.tool, name="Kindle", confidence=Confidence.high)
+        side = Entity(
+            type=EntityType.book,
+            name="Side",
+            confidence=Confidence.high,
+        )
+        main = Entity(
+            type=EntityType.book,
+            name="Main",
+            is_main_topic=True,
+            confidence=Confidence.medium,
+        )
+        picked = select_hardcover_candidates(
+            [already_low, tool, side, main],
+            limit=3,
+        )
+        self.assertEqual([entity.name for entity in picked], ["Main", "Side"])
+
+    def test_candidates_respect_cap_and_zero(self) -> None:
+        from app.hardcover import select_hardcover_candidates
+
+        items = [
+            Entity(
+                type=EntityType.book,
+                name="A",
+                is_main_topic=True,
+                confidence=Confidence.high,
+            ),
+            Entity(type=EntityType.book, name="B", confidence=Confidence.high),
+            Entity(type=EntityType.book, name="C", confidence=Confidence.medium),
+        ]
+        self.assertEqual(
+            [entity.name for entity in select_hardcover_candidates(items, 2)],
+            ["A", "B"],
+        )
+        self.assertEqual(select_hardcover_candidates(items, 0), [])
+
+    def test_hardcover_defaults_are_disabled(self) -> None:
+        settings = Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+        )
+        self.assertEqual(settings.hardcover_api_key, "")
+        self.assertEqual(settings.hardcover_books_per_job, 8)
+        self.assertEqual(settings.hardcover_timeout_seconds, 15.0)
+
+
+class HardcoverHttpTests(unittest.IsolatedAsyncioTestCase):
+    def _settings(self, **overrides: object) -> Settings:
+        values: dict[str, object] = {
+            "TELEGRAM_BOT_TOKEN": "x",
+            "OPENROUTER_API_KEY": "x",
+            "HARDCOVER_API_KEY": "secret",
+        }
+        values.update(overrides)
+        return Settings(**values)
+
+    def _dune(self) -> Entity:
+        return Entity(
+            type=EntityType.book,
+            name="Dune",
+            creator_or_author="Frank Herbert",
+            is_main_topic=True,
+            confidence=Confidence.high,
+        )
+
+    def _search_payload(self) -> dict:
+        return {
+            "data": {
+                "search": {
+                    "results": {
+                        "hits": [
+                            {
+                                "document": {
+                                    "id": 401,
+                                    "title": "Dune",
+                                    "author_names": ["Frank Herbert"],
+                                    "slug": "dune",
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    async def test_disabled_without_key(self) -> None:
+        from app.hardcover import HardcoverClient
+
+        client = HardcoverClient(self._settings(HARDCOVER_API_KEY=""))
+        self.assertFalse(client.enabled)
+        try:
+            self.assertEqual(await client.sync_books([self._dune()]), [])
+        finally:
+            await client.aclose()
+
+    async def test_disabled_when_per_job_is_zero(self) -> None:
+        from app.hardcover import HardcoverClient
+
+        client = HardcoverClient(self._settings(HARDCOVER_BOOKS_PER_JOB=0))
+        self.assertFalse(client.enabled)
+        try:
+            self.assertEqual(await client.sync_books([self._dune()]), [])
+        finally:
+            await client.aclose()
+
+    async def test_inserts_when_not_on_shelf(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        client = HardcoverClient(self._settings())
+        calls: list[str] = []
+
+        async def fake_post(*_args, **kwargs):
+            body = kwargs.get("json") or {}
+            query = body.get("query", "")
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            if "search(" in query:
+                calls.append("search")
+                return httpx.Response(200, json=self._search_payload(), request=request)
+            if "user_books" in query:
+                calls.append("user_books")
+                return httpx.Response(
+                    200,
+                    json={"data": {"me": {"id": 1, "user_books": []}}},
+                    request=request,
+                )
+            if "insert_user_book" in query:
+                calls.append("insert")
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "insert_user_book": {
+                                "id": 99,
+                                "user_book": {"id": 99, "status_id": 1, "book_id": 401},
+                            }
+                        }
+                    },
+                    request=request,
+                )
+            calls.append("other")
+            return httpx.Response(400, json={"error": "unexpected"}, request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([self._dune()])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(calls, ["search", "user_books", "insert"])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
+        self.assertEqual(actions[0].entity_name, "Dune")
+        self.assertEqual(actions[0].hardcover_url, "https://hardcover.app/books/dune")
+        self.assertEqual(actions[0].status_label, "Want to Read")
+
+    async def test_skips_when_already_on_shelf(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        client = HardcoverClient(self._settings())
+        calls: list[str] = []
+
+        async def fake_post(*_args, **kwargs):
+            body = kwargs.get("json") or {}
+            query = body.get("query", "")
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            if "search(" in query:
+                calls.append("search")
+                return httpx.Response(200, json=self._search_payload(), request=request)
+            if "user_books" in query:
+                calls.append("user_books")
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "me": [
+                                {
+                                    "id": 1,
+                                    "user_books": [{"id": 12, "status_id": 3}],
+                                }
+                            ]
+                        }
+                    },
+                    request=request,
+                )
+            calls.append("insert")
+            return httpx.Response(500, text="should not insert", request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([self._dune()])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(calls, ["search", "user_books"])
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.already_on_shelf)
+        self.assertEqual(actions[0].status_label, "Read")
+        self.assertEqual(actions[0].hardcover_url, "https://hardcover.app/books/dune")
+
+    async def test_no_match_does_not_mutate(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        client = HardcoverClient(self._settings())
+        calls: list[str] = []
+
+        async def fake_post(*_args, **kwargs):
+            body = kwargs.get("json") or {}
+            query = body.get("query", "")
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            if "search(" in query:
+                calls.append("search")
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "search": {
+                                "results": {
+                                    "hits": [
+                                        {
+                                            "document": {
+                                                "id": 2,
+                                                "title": "Dune Messiah",
+                                                "author_names": ["Frank Herbert"],
+                                                "slug": "dune-messiah",
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    request=request,
+                )
+            calls.append("other")
+            return httpx.Response(500, text="should not continue", request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([self._dune()])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(calls, ["search"])
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.no_match)
+        self.assertEqual(actions[0].hardcover_url, "")
+
+    async def test_http_error_does_not_raise(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        client = HardcoverClient(self._settings())
+
+        async def fake_post(*_args, **_kwargs):
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            return httpx.Response(429, text="Too Many Requests", request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([self._dune()])
+        finally:
+            await client.aclose()
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.error)
+
+
+class HardcoverSaveTests(unittest.IsolatedAsyncioTestCase):
+    def _result(self) -> ExtractionResult:
+        return ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Book Rec",
+            creator="@u",
+            summary="A novel.",
+            video_kind=VideoKind.single,
+            entities=[
+                Entity(
+                    type=EntityType.book,
+                    name="Dune",
+                    creator_or_author="Frank Herbert",
+                    is_main_topic=True,
+                    confidence=Confidence.high,
+                )
+            ],
+        )
+
+    async def test_save_without_key_skips_sync(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from app.hardcover import HardcoverClient, sync_hardcover_then_save
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                TELEGRAM_BOT_TOKEN="x",
+                OPENROUTER_API_KEY="x",
+                OBSIDIAN_VAULT_PATH=tmp,
+                OBSIDIAN_RELATIVE_DIR="Extracts",
+                PUID=-1,
+                PGID=-1,
+            )
+            client = HardcoverClient(settings)
+            client.sync_books = AsyncMock()  # type: ignore[method-assign]
+            result = self._result()
+            try:
+                path, actions = await sync_hardcover_then_save(
+                    settings, client, result
+                )
+            finally:
+                await client.aclose()
+            client.sync_books.assert_not_awaited()
+            self.assertEqual(actions, [])
+            self.assertTrue(path.exists())
+            self.assertIsNone(result.entities[0].hardcover_url)
+
+    async def test_save_with_key_syncs_before_vault_write(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.hardcover import (
+            HardcoverAction,
+            HardcoverClient,
+            HardcoverOutcome,
+            sync_hardcover_then_save,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                TELEGRAM_BOT_TOKEN="x",
+                OPENROUTER_API_KEY="x",
+                OBSIDIAN_VAULT_PATH=tmp,
+                OBSIDIAN_RELATIVE_DIR="Extracts",
+                HARDCOVER_API_KEY="secret",
+                PUID=-1,
+                PGID=-1,
+            )
+            client = MagicMock(spec=HardcoverClient)
+            client.enabled = True
+            client.sync_books = AsyncMock(
+                return_value=[
+                    HardcoverAction(
+                        entity_name="Dune",
+                        outcome=HardcoverOutcome.added,
+                        status_label="Want to Read",
+                        hardcover_url="https://hardcover.app/books/dune",
+                    )
+                ]
+            )
+            result = self._result()
+            path, actions = await sync_hardcover_then_save(settings, client, result)
+            client.sync_books.assert_awaited_once()
+            self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
+            self.assertEqual(
+                result.entities[0].hardcover_url,
+                "https://hardcover.app/books/dune",
+            )
+            note = path.read_text(encoding="utf-8")
+            self.assertIn("[hardcover](https://hardcover.app/books/dune)", note)
+
+
+class HardcoverObsidianTests(unittest.TestCase):
+    def test_bullet_includes_hardcover_link(self) -> None:
+        result = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Book Rec",
+            summary="A novel.",
+            video_kind=VideoKind.single,
+            entities=[
+                Entity(
+                    type=EntityType.book,
+                    name="Dune",
+                    creator_or_author="Frank Herbert",
+                    is_main_topic=True,
+                    hardcover_url="https://hardcover.app/books/dune",
+                )
+            ],
+        )
+        md = render_markdown(result)
+        self.assertIn("[hardcover](https://hardcover.app/books/dune)", md)
+        self.assertIn("[search](https://kagi.com/search?q=Dune+", md)
+
+
 if __name__ == "__main__":
     unittest.main()

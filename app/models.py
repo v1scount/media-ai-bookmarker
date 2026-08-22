@@ -139,13 +139,14 @@ class Entity(BaseModel):
     is_main_topic: bool = False
     confidence: Confidence = Confidence.medium
     suggested_link: Optional[str] = None
+    hardcover_url: Optional[str] = None
 
     @field_validator("creator_or_author", "notes", "name", mode="before")
     @classmethod
     def coerce_null_strings(cls, value: object) -> object:
         return _none_to_empty(value)
 
-    @field_validator("suggested_link", mode="before")
+    @field_validator("suggested_link", "hardcover_url", mode="before")
     @classmethod
     def empty_link_to_none(cls, value: object) -> object:
         if value is None:
