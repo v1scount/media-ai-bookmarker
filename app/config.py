@@ -144,6 +144,20 @@ class Settings(BaseSettings):
         ge=1.0,
         le=60.0,
     )
+    # Optional. Empty = skip Hardcover. Set to mark extracted books Want to Read on save.
+    hardcover_api_key: str = Field(default="", alias="HARDCOVER_API_KEY")
+    hardcover_books_per_job: int = Field(
+        default=8,
+        alias="HARDCOVER_BOOKS_PER_JOB",
+        ge=0,
+        le=20,
+    )
+    hardcover_timeout_seconds: float = Field(
+        default=15.0,
+        alias="HARDCOVER_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=60.0,
+    )
     ytdlp_cookies_file: Path | None = Field(
         default=None,
         alias="YTDLP_COOKIES_FILE",
@@ -152,9 +166,9 @@ class Settings(BaseSettings):
     puid: int = Field(default=1000, alias="PUID")
     pgid: int = Field(default=1000, alias="PGID")
 
-    @field_validator("kagi_api_key", mode="before")
+    @field_validator("kagi_api_key", "hardcover_api_key", mode="before")
     @classmethod
-    def strip_kagi_key(cls, value: object) -> object:
+    def strip_optional_api_key(cls, value: object) -> object:
         if value is None:
             return ""
         return str(value).strip()

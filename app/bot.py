@@ -18,9 +18,14 @@ from telegram.ext import (
 )
 
 from app.config import get_settings
+from app.hardcover import (
+    HardcoverClient,
+    format_hardcover_report,
+    sync_hardcover_then_save,
+)
 from app.kagi import KagiClient
 from app.models import ExtractionResult, extract_supported_url
-from app.obsidian import relative_vault_path, save_to_obsidian
+from app.obsidian import relative_vault_path
 from app.openrouter import OpenRouterClient
 from app.pipeline import Pipeline, format_preview
 
@@ -217,7 +222,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer()
         try:
-            path = await asyncio.to_thread(save_to_obsidian, settings, result)
+            hardcover: HardcoverClient | None = context.application.bot_data.get(
+                "hardcover"
+            )
+            path, actions = await sync_hardcover_then_save(
+                settings, hardcover, result
+            )
             rel = relative_vault_path(settings, path)
             await _pop_result(result_id)
             try:
@@ -225,8 +235,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception:
                 pass
             if query.message:
+                lines = [f"Saved to Obsidian:\n`{rel}`"]
+                report = format_hardcover_report(actions)
+                if report:
+                    lines.extend(["", report])
                 await query.message.reply_text(
-                    f"Saved to Obsidian:\n`{rel}`",
+                    "\n".join(lines),
                     parse_mode=ParseMode.MARKDOWN,
                 )
         except Exception as exc:
@@ -246,10 +260,12 @@ async def post_init(application: Application) -> None:
     settings = get_settings()
     openrouter = OpenRouterClient(settings)
     kagi = KagiClient(settings)
+    hardcover = HardcoverClient(settings)
     pipeline = Pipeline(settings, openrouter, kagi)
     application.bot_data["settings"] = settings
     application.bot_data["openrouter"] = openrouter
     application.bot_data["kagi"] = kagi
+    application.bot_data["hardcover"] = hardcover
     application.bot_data["pipeline"] = pipeline
     application.bot_data["job_lock"] = asyncio.Lock()
     # Checked once so we never upload frames to a text-only model
@@ -277,6 +293,9 @@ async def post_shutdown(application: Application) -> None:
     kagi: KagiClient | None = application.bot_data.get("kagi")
     if kagi:
         await kagi.aclose()
+    hardcover: HardcoverClient | None = application.bot_data.get("hardcover")
+    if hardcover:
+        await hardcover.aclose()
 
 
 def main() -> None:

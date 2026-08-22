@@ -65,6 +65,8 @@ def _render_entity_bullet(entity: Entity) -> list[str]:
         link = f" — [link]({entity.suggested_link})"
     else:
         link = f" — [search]({entity.search_url})"
+    if entity.hardcover_url:
+        link += f" — [hardcover]({entity.hardcover_url})"
     uncertain = " _(uncertain)_" if entity.confidence == Confidence.low else ""
 
     lines = [f"- **{type_label}** — *{entity.name}*{author}{link}{uncertain}"]

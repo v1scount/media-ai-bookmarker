@@ -38,6 +38,8 @@ cp .env.example .env
 | `PUID` / `PGID` | Host uid/gid that owns the vault (`id -u` / `id -g`). Required so notes are not root-owned |
 | `KAGI_API_KEY` | Optional. From [kagi.com/api/keys](https://kagi.com/api/keys). Empty = search links only |
 | `KAGI_SEARCH_PER_JOB` | Max Kagi API searches per video (default `3`; `0` disables the API) |
+| `HARDCOVER_API_KEY` | Optional. From [Hardcover API settings](https://docs.hardcover.app/api/getting-started/). Empty = skip Hardcover |
+| `HARDCOVER_BOOKS_PER_JOB` | Max books to look up per save (default `8`; `0` disables) |
 
 3. Discover your Telegram user id: message the bot with `/whoami` (no allowlist needed), or use [@userinfobot](https://t.me/userinfobot). Put that number in `ALLOWED_TELEGRAM_USER_IDS`.
 
@@ -112,6 +114,17 @@ Both sources write into the same vault folder. Notes are tagged `[tiktok, extrac
 or `[x, extract]` and carry a `source_kind` frontmatter field, so they stay easy to
 filter apart.
 
+## Hardcover
+
+Optional. Create an API token in Hardcover account settings and set `HARDCOVER_API_KEY`.
+New scoped tokens (August 2026+) need catalog search, own-library read, and
+`insert_user_book` write.
+
+On **Save** only, extracted `book` items (not low-confidence) are searched by title
+and author. A confident match that is not already on your shelf is added as Want to
+Read. Any existing status is left alone. Dismiss and failed matches do not write to
+Hardcover. Matched books get a `[hardcover](...)` link in the note.
+
 ## Local CLI (optional)
 
 For debugging without Telegram, run inside the container:
@@ -153,6 +166,12 @@ Notes on behaviour:
   directly. API failures fall back to the Kagi search link. This is billed separately
   ([~$12 / 1k searches](https://kagi.com/api/pricing); a $5 monthly credit is ~416 calls).
   `docker compose logs bot | grep kagi` shows each lookup.
+- If `HARDCOVER_API_KEY` is set, **Save** (or CLI `--save`) looks up extracted books on
+  [Hardcover](https://hardcover.app) and marks confident matches **Want to Read**. Books
+  already on your shelf (any status) are left unchanged. Dismiss never writes to Hardcover.
+  Unmatched or failed lookups still save the Obsidian note. New scoped tokens need catalog
+  search, own-library read, and `insert_user_book` write. `docker compose logs bot | grep hardcover`
+  shows each lookup.
 - Items marked low confidence render as `_(uncertain)_`.
 - List videos render every item under `## Items`; single-topic videos lead with
   `## Recommendation` and push passing mentions to `## Also mentioned`.
@@ -171,6 +190,7 @@ Notes on behaviour:
 7. Optional: Kagi Search API fills a few missing item URLs (skipped without `KAGI_API_KEY`)
 8. Always delete temp job directory
 9. Telegram preview + save keyboard; photos are fetched into the vault on save
+10. On Save only: optional Hardcover lookup marks extracted books Want to Read
 
 ## Token cost controls
 
@@ -211,6 +231,7 @@ app/
   frames.py       Near-duplicate frame dropping (saves image tokens)
   openrouter.py   Multimodal extraction client
   kagi.py         Optional Kagi Search API client (direct page URLs)
+  hardcover.py    Optional Hardcover client (Want to Read on save)
   obsidian.py     Markdown renderer + atomic vault write
   config.py       Settings from env
   models.py       Schema + URL parsing

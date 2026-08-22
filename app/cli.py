@@ -15,9 +15,14 @@ import logging
 import sys
 
 from app.config import get_settings
+from app.hardcover import (
+    HardcoverClient,
+    format_hardcover_report,
+    sync_hardcover_then_save,
+)
 from app.kagi import KagiClient
 from app.models import extract_supported_url
-from app.obsidian import relative_vault_path, save_to_obsidian
+from app.obsidian import relative_vault_path
 from app.openrouter import OpenRouterClient
 from app.pipeline import Pipeline, format_preview
 
@@ -31,6 +36,7 @@ async def _run(url: str, save: bool) -> int:
     settings = get_settings()
     openrouter = OpenRouterClient(settings)
     kagi = KagiClient(settings)
+    hardcover = HardcoverClient(settings)
     pipeline = Pipeline(settings, openrouter, kagi)
     try:
         pipeline.model_supports_images = await openrouter.verify_model()
@@ -45,12 +51,18 @@ async def _run(url: str, save: bool) -> int:
         preview = format_preview(result)
         print(preview.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<code>", "`").replace("</code>", "`"))
         if save:
-            path = save_to_obsidian(settings, result)
+            path, actions = await sync_hardcover_then_save(
+                settings, hardcover, result
+            )
             print(f"\nSaved: {relative_vault_path(settings, path)}")
+            report = format_hardcover_report(actions)
+            if report:
+                print(report)
         return 0
     finally:
         await openrouter.aclose()
         await kagi.aclose()
+        await hardcover.aclose()
 
 
 def main(argv: list[str] | None = None) -> int:
