@@ -244,7 +244,7 @@ class Pipeline:
                 entity.suggested_link = url
 
     def _uses_llm(self, kind: SourceKind) -> bool:
-        """TikTok always needs the model; X only when explicitly enabled."""
+        """TikTok always uses the model; X does too unless X_USE_LLM is false."""
         return kind != SourceKind.x or self.settings.x_use_llm
 
     @staticmethod
@@ -737,6 +737,8 @@ def _preview_entity_links(entity: Entity, amazon_host: str) -> str:
         parts.append(f'<a href="{_html(entity.search_url)}">search</a>')
     if entity.hardcover_url:
         parts.append(f'<a href="{_html(entity.hardcover_url)}">hardcover</a>')
+    if entity.letterboxd_url:
+        parts.append(f'<a href="{_html(entity.letterboxd_url)}">letterboxd</a>')
     if not parts:
         return ""
     return " — " + " — ".join(parts)

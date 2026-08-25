@@ -43,6 +43,9 @@ MERCADO_LIBRE_SEARCH_TEMPLATE = "https://listado.mercadolibre.com.ar/{slug}"
 AMAZON_SEARCH_TEMPLATE = "https://{host}/s?k={query}"
 EBAY_SEARCH_TEMPLATE = "https://www.ebay.com/sch/i.html?_nkw={query}"
 TRAILING_HASHTAGS_RE = re.compile(r"(?:(?:^|\s)#\w[\w.-]*)+$", re.UNICODE)
+TRAILING_YEAR_RE = re.compile(r"\((\d{4})\)\s*$")
+YEAR_MIN = 1870
+YEAR_MAX = 2100
 
 
 class SourceKind(str, Enum):
@@ -136,6 +139,34 @@ def _none_to_empty(value: object) -> object:
     return "" if value is None else value
 
 
+def parse_year(value: object) -> Optional[int]:
+    """Coerce a model year to int, or None when missing or implausible."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    year: Optional[int] = None
+    if isinstance(value, int):
+        year = value
+    elif isinstance(value, float) and value.is_integer():
+        year = int(value)
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned.isdigit():
+            year = int(cleaned)
+    if year is None or year < YEAR_MIN or year > YEAR_MAX:
+        return None
+    return year
+
+
+def year_from_text(text: str) -> Optional[int]:
+    """Trailing '(2010)' in a name or note, otherwise None. Never guesses."""
+    match = TRAILING_YEAR_RE.search((text or "").strip())
+    if not match:
+        return None
+    return parse_year(match.group(1))
+
+
 def split_caption(text: str) -> tuple[str, str]:
     """Split a trailing hashtag dump from the prose of a caption."""
     cleaned = (text or "").strip()
@@ -178,13 +209,16 @@ class Entity(BaseModel):
     confidence: Confidence = Confidence.medium
     suggested_link: Optional[str] = None
     hardcover_url: Optional[str] = None
+    letterboxd_url: Optional[str] = None
+    # Release year when the model (or a trailing "(2010)") knows it
+    year: Optional[int] = None
 
     @field_validator("creator_or_author", "notes", "name", mode="before")
     @classmethod
     def coerce_null_strings(cls, value: object) -> object:
         return _none_to_empty(value)
 
-    @field_validator("suggested_link", "hardcover_url", mode="before")
+    @field_validator("suggested_link", "hardcover_url", "letterboxd_url", mode="before")
     @classmethod
     def empty_link_to_none(cls, value: object) -> object:
         if value is None:
@@ -195,6 +229,11 @@ class Entity(BaseModel):
                 return None
             return cleaned
         return value
+
+    @field_validator("year", mode="before")
+    @classmethod
+    def coerce_year(cls, value: object) -> object:
+        return parse_year(value)
 
     @field_validator("is_main_topic", mode="before")
     @classmethod
@@ -261,6 +300,17 @@ class Entity(BaseModel):
             ("Amazon", AMAZON_SEARCH_TEMPLATE.format(host=host, query=quoted)),
             ("eBay", EBAY_SEARCH_TEMPLATE.format(query=quoted)),
         ]
+
+
+def resolved_year(entity: Entity) -> Optional[int]:
+    """Prefer the structured year; fall back to a trailing '(YYYY)' in name/notes."""
+    if entity.year is not None:
+        return entity.year
+    for text in (entity.name, entity.notes):
+        found = year_from_text(text)
+        if found is not None:
+            return found
+    return None
 
 
 class MediaKind(str, Enum):

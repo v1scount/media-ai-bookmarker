@@ -71,6 +71,8 @@ def _render_entity_links(entity: Entity, amazon_host: str) -> list[str]:
         lines.append(f"- [search]({entity.search_url})")
     if entity.hardcover_url:
         lines.append(f"- [hardcover]({entity.hardcover_url})")
+    if entity.letterboxd_url:
+        lines.append(f"- [letterboxd]({entity.letterboxd_url})")
     return lines
 
 

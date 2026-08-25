@@ -33,7 +33,10 @@ from app.models import (
     extract_supported_url,
     extract_tiktok_url,
     extract_x_url,
+    parse_year,
+    resolved_year,
     split_caption,
+    year_from_text,
 )
 from app.obsidian import build_note_filename, render_markdown, save_to_obsidian
 from app.openrouter import RESULT_JSON_SCHEMA, truncate_text
@@ -95,13 +98,9 @@ class AllowedIdsTests(unittest.TestCase):
         self.assertEqual(settings.allowed_telegram_user_ids, [42])
 
     def test_kagi_defaults_are_links_only(self) -> None:
-        settings = Settings(
-            TELEGRAM_BOT_TOKEN="x",
-            OPENROUTER_API_KEY="x",
-        )
-        self.assertEqual(settings.kagi_api_key, "")
-        self.assertEqual(settings.kagi_search_per_job, 3)
-        self.assertEqual(settings.kagi_timeout_seconds, 15.0)
+        self.assertEqual(Settings.model_fields["kagi_api_key"].default, "")
+        self.assertEqual(Settings.model_fields["kagi_search_per_job"].default, 3)
+        self.assertEqual(Settings.model_fields["kagi_timeout_seconds"].default, 15.0)
 
     def test_amazon_search_host_default_and_strip(self) -> None:
         settings = Settings(
@@ -348,6 +347,27 @@ class ExtractionSchemaTests(unittest.TestCase):
             [entity.name for entity in result.ordered_entities()], ["main", "side"]
         )
 
+    def test_year_coercion_and_range(self) -> None:
+        self.assertEqual(Entity(name="Inception", year=2010).year, 2010)
+        self.assertEqual(Entity.model_validate({"name": "x", "year": "2010"}).year, 2010)
+        self.assertEqual(Entity.model_validate({"name": "x", "year": 2010.0}).year, 2010)
+        self.assertIsNone(Entity.model_validate({"name": "x", "year": None}).year)
+        self.assertIsNone(Entity.model_validate({"name": "x", "year": ""}).year)
+        self.assertIsNone(Entity.model_validate({"name": "x", "year": 1800}).year)
+        self.assertIsNone(Entity.model_validate({"name": "x", "year": 9999}).year)
+        self.assertIsNone(parse_year(True))
+
+    def test_year_fallback_from_trailing_parens(self) -> None:
+        self.assertEqual(year_from_text("Dune (2021)"), 2021)
+        self.assertIsNone(year_from_text("Dune (2021) recap"))
+        named = Entity(type=EntityType.movie, name="Dune (2021)")
+        self.assertIsNone(named.year)
+        self.assertEqual(resolved_year(named), 2021)
+        noted = Entity(type=EntityType.movie, name="Heat", notes="Mann cut (1995)")
+        self.assertEqual(resolved_year(noted), 1995)
+        explicit = Entity(type=EntityType.movie, name="Dune (1984)", year=2021)
+        self.assertEqual(resolved_year(explicit), 2021)
+
 
 class TokenGuardTests(unittest.TestCase):
     def test_truncate_leaves_short_text(self) -> None:
@@ -367,6 +387,11 @@ class TokenGuardTests(unittest.TestCase):
             self.assertNotIn(field, schema["properties"])
         self.assertIn("title", schema["properties"])
         self.assertIn("title", schema["required"])
+        entity_schema = schema["properties"]["entities"]["items"]
+        self.assertIn("year", entity_schema["properties"])
+        self.assertIn("year", entity_schema["required"])
+        self.assertNotIn("letterboxd_url", entity_schema["properties"])
+        self.assertNotIn("hardcover_url", entity_schema["properties"])
 
     def test_every_schema_field_is_documented(self) -> None:
         entity_props = RESULT_JSON_SCHEMA["schema"]["properties"]["entities"]["items"][
@@ -1152,6 +1177,9 @@ class RawPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.post.text, "Hello")
             self.assertEqual(result.source_kind, SourceKind.x)
 
+    def test_x_uses_the_model_by_default(self) -> None:
+        self.assertTrue(Settings.model_fields["x_use_llm"].default)
+
     async def test_x_uses_the_model_when_enabled(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
 
@@ -1698,13 +1726,13 @@ class HardcoverHelperTests(unittest.TestCase):
         self.assertEqual(select_hardcover_candidates(items, 0), [])
 
     def test_hardcover_defaults_are_disabled(self) -> None:
-        settings = Settings(
-            TELEGRAM_BOT_TOKEN="x",
-            OPENROUTER_API_KEY="x",
-        )
-        self.assertEqual(settings.hardcover_api_key, "")
-        self.assertEqual(settings.hardcover_books_per_job, 8)
-        self.assertEqual(settings.hardcover_timeout_seconds, 15.0)
+        self.assertEqual(Settings.model_fields["hardcover_api_key"].default, "")
+        self.assertEqual(Settings.model_fields["hardcover_books_per_job"].default, 8)
+        self.assertEqual(Settings.model_fields["hardcover_timeout_seconds"].default, 15.0)
+        self.assertEqual(Settings.model_fields["letterboxd_middleman_url"].default, "")
+        self.assertEqual(Settings.model_fields["letterboxd_middleman_api_key"].default, "")
+        self.assertEqual(Settings.model_fields["letterboxd_movies_per_job"].default, 4)
+        self.assertEqual(Settings.model_fields["letterboxd_timeout_seconds"].default, 180.0)
 
 
 class HardcoverHttpTests(unittest.IsolatedAsyncioTestCase):
@@ -1953,6 +1981,7 @@ class HardcoverSaveTests(unittest.IsolatedAsyncioTestCase):
                 OPENROUTER_API_KEY="x",
                 OBSIDIAN_VAULT_PATH=tmp,
                 OBSIDIAN_RELATIVE_DIR="Extracts",
+                HARDCOVER_API_KEY="",
                 PUID=-1,
                 PGID=-1,
             )
@@ -2034,6 +2063,550 @@ class HardcoverObsidianTests(unittest.TestCase):
         md = render_markdown(result)
         self.assertIn("[hardcover](https://hardcover.app/books/dune)", md)
         self.assertIn("[search](https://kagi.com/search?q=Dune+", md)
+
+
+class LetterboxdHelperTests(unittest.TestCase):
+    def test_candidates_respect_cap_skip_low_and_non_movies(self) -> None:
+        from app.letterboxd import select_letterboxd_candidates
+
+        items = [
+            Entity(
+                type=EntityType.movie,
+                name="Main",
+                is_main_topic=True,
+                confidence=Confidence.high,
+            ),
+            Entity(
+                type=EntityType.movie,
+                name="Low",
+                confidence=Confidence.low,
+            ),
+            Entity(type=EntityType.book, name="Novel", confidence=Confidence.high),
+            Entity(type=EntityType.series, name="Show", confidence=Confidence.high),
+            Entity(type=EntityType.movie, name="Side", confidence=Confidence.medium),
+        ]
+        self.assertEqual(
+            [entity.name for entity in select_letterboxd_candidates(items, 2)],
+            ["Main", "Side"],
+        )
+        self.assertEqual(select_letterboxd_candidates(items, 0), [])
+
+    def test_loopback_url_rewritten_inside_docker(self) -> None:
+        from app.letterboxd import resolve_middleman_url, watchlist_url
+
+        self.assertEqual(
+            resolve_middleman_url("http://127.0.0.1:8787", in_docker=True),
+            "http://host.docker.internal:8787",
+        )
+        self.assertEqual(
+            resolve_middleman_url("http://localhost:8787", in_docker=True),
+            "http://host.docker.internal:8787",
+        )
+        self.assertEqual(
+            resolve_middleman_url("http://127.0.0.1:8787", in_docker=False),
+            "http://127.0.0.1:8787",
+        )
+        self.assertEqual(
+            watchlist_url("http://host.docker.internal:8787"),
+            "http://host.docker.internal:8787/watchlist",
+        )
+
+    def test_payload_uses_director_and_resolved_year(self) -> None:
+        from app.letterboxd import watchlist_payload
+
+        film = Entity(
+            type=EntityType.movie,
+            name="Inception",
+            creator_or_author="Christopher Nolan",
+            year=2010,
+        )
+        self.assertEqual(
+            watchlist_payload(film),
+            {
+                "title": "Inception",
+                "director": "Christopher Nolan",
+                "year": 2010,
+            },
+        )
+        from_name = Entity(type=EntityType.movie, name="Dune (2021)")
+        self.assertEqual(watchlist_payload(from_name)["year"], 2021)
+        unknown = Entity(type=EntityType.movie, name="Heat")
+        self.assertNotIn("year", watchlist_payload(unknown))
+
+    def test_report_lines(self) -> None:
+        from app.letterboxd import (
+            LetterboxdAction,
+            LetterboxdOutcome,
+            format_letterboxd_report,
+        )
+
+        report = format_letterboxd_report(
+            [
+                LetterboxdAction(
+                    entity_name="Inception",
+                    outcome=LetterboxdOutcome.added,
+                    letterboxd_url="https://letterboxd.com/film/inception/",
+                ),
+                LetterboxdAction(
+                    entity_name="Heat",
+                    outcome=LetterboxdOutcome.already_on_watchlist,
+                ),
+                LetterboxdAction(
+                    entity_name="Dune",
+                    outcome=LetterboxdOutcome.ambiguous,
+                ),
+            ]
+        )
+        self.assertIn("Letterboxd: added Inception to watchlist", report)
+        self.assertIn("already on your watchlist", report)
+        self.assertIn("ambiguous match", report)
+
+
+class LetterboxdHttpTests(unittest.IsolatedAsyncioTestCase):
+    def _settings(self, **overrides: object) -> Settings:
+        values: dict[str, object] = {
+            "TELEGRAM_BOT_TOKEN": "x",
+            "OPENROUTER_API_KEY": "x",
+            "LETTERBOXD_MIDDLEMAN_URL": "http://127.0.0.1:8787",
+            "LETTERBOXD_MIDDLEMAN_API_KEY": "secret",
+        }
+        values.update(overrides)
+        return Settings(**values)
+
+    def _inception(self) -> Entity:
+        return Entity(
+            type=EntityType.movie,
+            name="Inception",
+            creator_or_author="Christopher Nolan",
+            year=2010,
+            is_main_topic=True,
+            confidence=Confidence.high,
+        )
+
+    async def test_disabled_without_url_or_key(self) -> None:
+        from app.letterboxd import LetterboxdClient
+
+        client = LetterboxdClient(self._settings(LETTERBOXD_MIDDLEMAN_URL=""))
+        self.assertFalse(client.enabled)
+        try:
+            self.assertEqual(await client.sync_movies([self._inception()]), [])
+        finally:
+            await client.aclose()
+
+        client = LetterboxdClient(self._settings(LETTERBOXD_MIDDLEMAN_API_KEY=""))
+        self.assertFalse(client.enabled)
+        try:
+            self.assertEqual(await client.sync_movies([self._inception()]), [])
+        finally:
+            await client.aclose()
+
+    async def test_disabled_when_per_job_is_zero(self) -> None:
+        from app.letterboxd import LetterboxdClient
+
+        client = LetterboxdClient(self._settings(LETTERBOXD_MOVIES_PER_JOB=0))
+        self.assertFalse(client.enabled)
+        try:
+            self.assertEqual(await client.sync_movies([self._inception()]), [])
+        finally:
+            await client.aclose()
+
+    async def test_added_stamps_url(self) -> None:
+        from app.letterboxd import LetterboxdClient, LetterboxdOutcome
+
+        client = LetterboxdClient(self._settings())
+        captured: dict[str, object] = {}
+
+        async def fake_post(url, **kwargs):
+            captured["url"] = str(url)
+            captured["json"] = kwargs.get("json")
+            captured["auth"] = kwargs.get("headers", {}).get("Authorization")
+            request = httpx.Request("POST", url)
+            return httpx.Response(
+                200,
+                json={
+                    "outcome": "added",
+                    "title": "Inception",
+                    "year": 2010,
+                    "url": "https://letterboxd.com/film/inception/",
+                },
+                request=request,
+            )
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_movies([self._inception()])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(captured["url"], "http://127.0.0.1:8787/watchlist")
+        self.assertEqual(captured["auth"], "Bearer secret")
+        self.assertEqual(
+            captured["json"],
+            {
+                "title": "Inception",
+                "director": "Christopher Nolan",
+                "year": 2010,
+            },
+        )
+        self.assertEqual(actions[0].outcome, LetterboxdOutcome.added)
+        self.assertEqual(
+            actions[0].letterboxd_url, "https://letterboxd.com/film/inception/"
+        )
+
+    async def test_already_on_watchlist_stamps_url(self) -> None:
+        from app.letterboxd import LetterboxdClient, LetterboxdOutcome
+
+        client = LetterboxdClient(self._settings())
+
+        async def fake_post(url, **kwargs):
+            request = httpx.Request("POST", url)
+            return httpx.Response(
+                200,
+                json={
+                    "outcome": "already_on_watchlist",
+                    "url": "https://letterboxd.com/film/inception/",
+                },
+                request=request,
+            )
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_movies([self._inception()])
+        finally:
+            await client.aclose()
+        self.assertEqual(actions[0].outcome, LetterboxdOutcome.already_on_watchlist)
+        self.assertEqual(
+            actions[0].letterboxd_url, "https://letterboxd.com/film/inception/"
+        )
+
+    async def test_no_match_ambiguous_auth_do_not_stamp(self) -> None:
+        from app.letterboxd import LetterboxdClient, LetterboxdOutcome
+
+        client = LetterboxdClient(self._settings())
+        outcomes = ["no_match", "ambiguous", "auth_required"]
+        seen: list[str] = []
+
+        async def fake_post(url, **kwargs):
+            outcome = outcomes[len(seen)]
+            seen.append(outcome)
+            request = httpx.Request("POST", url)
+            return httpx.Response(
+                200,
+                json={"outcome": outcome, "url": "https://letterboxd.com/film/x/"},
+                request=request,
+            )
+
+        films = [
+            Entity(type=EntityType.movie, name="A", confidence=Confidence.high),
+            Entity(type=EntityType.movie, name="B", confidence=Confidence.high),
+            Entity(type=EntityType.movie, name="C", confidence=Confidence.high),
+        ]
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_movies(films)
+        finally:
+            await client.aclose()
+        self.assertEqual(
+            [action.outcome for action in actions],
+            [
+                LetterboxdOutcome.no_match,
+                LetterboxdOutcome.ambiguous,
+                LetterboxdOutcome.auth_required,
+            ],
+        )
+        self.assertTrue(all(action.letterboxd_url == "" for action in actions))
+
+    async def test_unauthorized_is_error(self) -> None:
+        from app.letterboxd import LetterboxdClient, LetterboxdOutcome
+
+        client = LetterboxdClient(self._settings())
+
+        async def fake_post(url, **kwargs):
+            request = httpx.Request("POST", url)
+            return httpx.Response(401, json={"detail": "nope"}, request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_movies([self._inception()])
+        finally:
+            await client.aclose()
+        self.assertEqual(actions[0].outcome, LetterboxdOutcome.error)
+        self.assertEqual(actions[0].letterboxd_url, "")
+
+
+class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
+    def _vault(self, tmp: str, **overrides: object) -> Settings:
+        values: dict[str, object] = {
+            "TELEGRAM_BOT_TOKEN": "x",
+            "OPENROUTER_API_KEY": "x",
+            "OBSIDIAN_VAULT_PATH": tmp,
+            "OBSIDIAN_RELATIVE_DIR": "Extracts",
+            "PUID": -1,
+            "PGID": -1,
+        }
+        values.update(overrides)
+        return Settings(**values)
+
+    def _book_result(self, source_kind: SourceKind = SourceKind.tiktok) -> ExtractionResult:
+        return ExtractionResult(
+            source_url="https://x.com/u/status/1",
+            source_kind=source_kind,
+            title="Book Rec",
+            summary="A novel.",
+            video_kind=VideoKind.single,
+            entities=[
+                Entity(
+                    type=EntityType.book,
+                    name="Dune",
+                    creator_or_author="Frank Herbert",
+                    is_main_topic=True,
+                    confidence=Confidence.high,
+                )
+            ],
+        )
+
+    def _movie_result(self) -> ExtractionResult:
+        return ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Film Rec",
+            summary="A movie.",
+            video_kind=VideoKind.single,
+            entities=[
+                Entity(
+                    type=EntityType.movie,
+                    name="Inception",
+                    creator_or_author="Christopher Nolan",
+                    year=2010,
+                    is_main_topic=True,
+                    confidence=Confidence.high,
+                )
+            ],
+        )
+
+    async def test_books_only_never_posts_to_letterboxd(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.hardcover import HardcoverClient, sync_then_save
+        from app.letterboxd import LetterboxdClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault(tmp, HARDCOVER_API_KEY="secret")
+            hardcover = MagicMock(spec=HardcoverClient)
+            hardcover.enabled = True
+            hardcover.sync_books = AsyncMock(return_value=[])
+            letterboxd = MagicMock(spec=LetterboxdClient)
+            letterboxd.enabled = True
+            letterboxd.sync_movies = AsyncMock(return_value=[])
+            path, hc_actions, lb_actions = await sync_then_save(
+                settings, hardcover, self._book_result(), letterboxd
+            )
+            hardcover.sync_books.assert_awaited_once()
+            letterboxd.sync_movies.assert_not_awaited()
+            self.assertEqual(hc_actions, [])
+            self.assertEqual(lb_actions, [])
+            self.assertTrue(path.exists())
+
+    async def test_movies_only_never_calls_hardcover(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.hardcover import HardcoverClient, sync_then_save
+        from app.letterboxd import (
+            LetterboxdAction,
+            LetterboxdClient,
+            LetterboxdOutcome,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault(
+                tmp,
+                LETTERBOXD_MIDDLEMAN_URL="http://127.0.0.1:8787",
+                LETTERBOXD_MIDDLEMAN_API_KEY="secret",
+            )
+            hardcover = MagicMock(spec=HardcoverClient)
+            hardcover.enabled = True
+            hardcover.sync_books = AsyncMock(return_value=[])
+            letterboxd = MagicMock(spec=LetterboxdClient)
+            letterboxd.enabled = True
+            letterboxd.sync_movies = AsyncMock(
+                return_value=[
+                    LetterboxdAction(
+                        entity_name="Inception",
+                        outcome=LetterboxdOutcome.added,
+                        letterboxd_url="https://letterboxd.com/film/inception/",
+                    )
+                ]
+            )
+            result = self._movie_result()
+            path, hc_actions, lb_actions = await sync_then_save(
+                settings, hardcover, result, letterboxd
+            )
+            hardcover.sync_books.assert_not_awaited()
+            letterboxd.sync_movies.assert_awaited_once()
+            self.assertEqual(hc_actions, [])
+            self.assertEqual(lb_actions[0].outcome, LetterboxdOutcome.added)
+            self.assertEqual(
+                result.entities[0].letterboxd_url,
+                "https://letterboxd.com/film/inception/",
+            )
+            note = path.read_text(encoding="utf-8")
+            self.assertIn("[letterboxd](https://letterboxd.com/film/inception/)", note)
+
+    async def test_mixed_calls_both(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.hardcover import (
+            HardcoverAction,
+            HardcoverClient,
+            HardcoverOutcome,
+            sync_then_save,
+        )
+        from app.letterboxd import (
+            LetterboxdAction,
+            LetterboxdClient,
+            LetterboxdOutcome,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault(tmp, HARDCOVER_API_KEY="secret")
+            hardcover = MagicMock(spec=HardcoverClient)
+            hardcover.enabled = True
+            hardcover.sync_books = AsyncMock(
+                return_value=[
+                    HardcoverAction(
+                        entity_name="Dune",
+                        outcome=HardcoverOutcome.added,
+                        hardcover_url="https://hardcover.app/books/dune",
+                    )
+                ]
+            )
+            letterboxd = MagicMock(spec=LetterboxdClient)
+            letterboxd.enabled = True
+            letterboxd.sync_movies = AsyncMock(
+                return_value=[
+                    LetterboxdAction(
+                        entity_name="Inception",
+                        outcome=LetterboxdOutcome.added,
+                        letterboxd_url="https://letterboxd.com/film/inception/",
+                    )
+                ]
+            )
+            result = ExtractionResult(
+                source_url="https://www.tiktok.com/@u/video/1",
+                title="Mix",
+                summary="Both.",
+                entities=[
+                    Entity(
+                        type=EntityType.book,
+                        name="Dune",
+                        is_main_topic=True,
+                        confidence=Confidence.high,
+                    ),
+                    Entity(
+                        type=EntityType.movie,
+                        name="Inception",
+                        is_main_topic=True,
+                        confidence=Confidence.high,
+                    ),
+                ],
+            )
+            await sync_then_save(settings, hardcover, result, letterboxd)
+            hardcover.sync_books.assert_awaited_once()
+            letterboxd.sync_movies.assert_awaited_once()
+            self.assertEqual(
+                result.entities[0].hardcover_url, "https://hardcover.app/books/dune"
+            )
+            self.assertEqual(
+                result.entities[1].letterboxd_url,
+                "https://letterboxd.com/film/inception/",
+            )
+
+    async def test_x_book_still_syncs_hardcover(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.hardcover import (
+            HardcoverAction,
+            HardcoverClient,
+            HardcoverOutcome,
+            sync_then_save,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault(tmp, HARDCOVER_API_KEY="secret")
+            hardcover = MagicMock(spec=HardcoverClient)
+            hardcover.enabled = True
+            hardcover.sync_books = AsyncMock(
+                return_value=[
+                    HardcoverAction(
+                        entity_name="Dune",
+                        outcome=HardcoverOutcome.added,
+                        hardcover_url="https://hardcover.app/books/dune",
+                    )
+                ]
+            )
+            result = self._book_result(SourceKind.x)
+            path, actions, lb_actions = await sync_then_save(
+                settings, hardcover, result
+            )
+            hardcover.sync_books.assert_awaited_once()
+            self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
+            self.assertEqual(lb_actions, [])
+            self.assertEqual(result.source_kind, SourceKind.x)
+            self.assertTrue(path.exists())
+
+    async def test_letterboxd_error_still_writes_note(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.hardcover import HardcoverClient, sync_then_save
+        from app.letterboxd import (
+            LetterboxdAction,
+            LetterboxdClient,
+            LetterboxdOutcome,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._vault(tmp)
+            hardcover = MagicMock(spec=HardcoverClient)
+            hardcover.enabled = False
+            letterboxd = MagicMock(spec=LetterboxdClient)
+            letterboxd.enabled = True
+            letterboxd.sync_movies = AsyncMock(
+                return_value=[
+                    LetterboxdAction(
+                        entity_name="Inception",
+                        outcome=LetterboxdOutcome.error,
+                    )
+                ]
+            )
+            result = self._movie_result()
+            path, _hc, lb_actions = await sync_then_save(
+                settings, hardcover, result, letterboxd
+            )
+            self.assertEqual(lb_actions[0].outcome, LetterboxdOutcome.error)
+            self.assertIsNone(result.entities[0].letterboxd_url)
+            self.assertTrue(path.exists())
+
+
+class LetterboxdObsidianTests(unittest.TestCase):
+    def test_bullet_includes_letterboxd_link(self) -> None:
+        result = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Film Rec",
+            summary="A movie.",
+            video_kind=VideoKind.single,
+            entities=[
+                Entity(
+                    type=EntityType.movie,
+                    name="Inception",
+                    creator_or_author="Christopher Nolan",
+                    is_main_topic=True,
+                    letterboxd_url="https://letterboxd.com/film/inception/",
+                )
+            ],
+        )
+        md = render_markdown(result)
+        self.assertIn("[letterboxd](https://letterboxd.com/film/inception/)", md)
+        preview = format_preview(result)
+        self.assertIn("letterboxd", preview)
 
 
 if __name__ == "__main__":

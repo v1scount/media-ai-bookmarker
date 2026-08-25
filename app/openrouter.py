@@ -43,6 +43,9 @@ How thorough to be:
 
 Naming and links:
 - Give the exact name. Put the author, artist, band, studio, or channel in creator_or_author.
+  For movies, creator_or_author is the director.
+- year is the release year for a movie, and for a book when it is stated. Otherwise null.
+  Never guess a year.
 - suggested_link only for a URL you are confident is correct: prefer a URL given to
   you in linked_pages, an official site, a store page, or a link stated in the source.
   Otherwise null - never guess a URL, a plain web search is added automatically.
@@ -77,6 +80,7 @@ ENTITY_SCHEMA: dict[str, Any] = {
         "is_main_topic",
         "confidence",
         "suggested_link",
+        "year",
     ],
     "properties": {
         "type": {
@@ -113,7 +117,7 @@ ENTITY_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "Author, artist, band, director, studio, or channel behind the item. "
-                "Empty string if unknown."
+                "For movies this is the director. Empty string if unknown."
             ),
         },
         "notes": {
@@ -142,6 +146,13 @@ ENTITY_SCHEMA: dict[str, Any] = {
             "description": (
                 "Official URL only when confident it is correct, otherwise null. "
                 "Never guess a URL."
+            ),
+        },
+        "year": {
+            "type": ["integer", "null"],
+            "description": (
+                "Release year for a movie, and for a book when stated. "
+                "Null when unknown or the item has no year. Never guess."
             ),
         },
     },
@@ -402,7 +413,7 @@ class OpenRouterClient:
                 "content": (
                     "Fix this response so it matches the required schema "
                     "(keys: title, summary, video_kind, entities; "
-                    "use \"\" instead of null for text fields).\n\n"
+                    "use \"\" instead of null for text fields; year may be null).\n\n"
                     f"Validation error:\n{str(error)[:800]}\n\n"
                     f"Invalid response:\n{bad_content[:4000]}"
                 ),

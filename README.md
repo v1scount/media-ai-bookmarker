@@ -3,7 +3,7 @@
 Self-hosted bot: send a TikTok or X (Twitter) link on Telegram → local extraction → OpenRouter multimodal extraction → optional save as Markdown into your Obsidian vault.
 
 - **TikTok:** `yt-dlp` download → `faster-whisper` transcript + sampled frames → model extraction.
-- **X:** saved verbatim by default, with **no model call** — the post text, its links (each with the linked page's title and description), and its photos downloaded into your vault. Set `X_USE_LLM=true` to run X posts through the model like TikTok videos instead.
+- **X:** same model extraction by default (post text, linked pages, photos, and video when present). Set `X_USE_LLM=false` to save the post verbatim with no model call.
 
 No transcripts, audio, or video are persisted. Temp media is deleted after each job.
 
@@ -33,13 +33,16 @@ cp .env.example .env
 | `OBSIDIAN_RELATIVE_DIR` | Folder inside vault, shared by both sources (recommended: `Extracts`) |
 | `OBSIDIAN_ATTACHMENTS_DIR` | Optional folder for saved photos and videos (default: `attachments` under the notes folder) |
 | `MAX_ATTACHMENT_MB` | Per-file ceiling for saved media (default `100`) |
-| `X_USE_LLM` | `false` (default) saves X posts verbatim; `true` sends them to the model |
+| `X_USE_LLM` | `true` (default) sends X posts to the model; `false` saves them verbatim |
 | `ALLOWED_TELEGRAM_USER_IDS` | Your numeric Telegram user id |
 | `PUID` / `PGID` | Host uid/gid that owns the vault (`id -u` / `id -g`). Required so notes are not root-owned |
 | `KAGI_API_KEY` | Optional. From [kagi.com/api/keys](https://kagi.com/api/keys). Empty = search links only |
 | `KAGI_SEARCH_PER_JOB` | Max Kagi API searches per video (default `3`; `0` disables the API) |
 | `HARDCOVER_API_KEY` | Optional. From [Hardcover API settings](https://docs.hardcover.app/api/getting-started/). Empty = skip Hardcover |
 | `HARDCOVER_BOOKS_PER_JOB` | Max books to look up per save (default `8`; `0` disables) |
+| `LETTERBOXD_MIDDLEMAN_URL` | Optional. letterboxd-middleman base URL. Empty = skip Letterboxd. From Docker: `http://letterboxd-middleman:8787` (shared `media-ai` network) |
+| `LETTERBOXD_MIDDLEMAN_API_KEY` | Optional. Same secret as the middleman's `MIDDLEMAN_API_KEY` |
+| `LETTERBOXD_MOVIES_PER_JOB` | Max movies to look up per save (default `4`; `0` disables) |
 | `AMAZON_SEARCH_HOST` | Host for product Amazon search links (default `www.amazon.com`) |
 
 3. Discover your Telegram user id: message the bot with `/whoami` (no allowlist needed), or use [@userinfobot](https://t.me/userinfobot). Put that number in `ALLOWED_TELEGRAM_USER_IDS`.
@@ -79,10 +82,11 @@ X metadata comes from the public FxTwitter mirror, with VxTwitter as a fallback,
 no X API key or login is needed for text and photos. Only the single post you send
 is read — threads are not unrolled, though a quoted post's text and links are included.
 
-By default an X post is **captured, not summarised**: the note is the post's own text,
-a `## Links` section, and a `## Media` section embedding its photos. Nothing is sent to
-OpenRouter, so these notes are free and near-instant. Set `X_USE_LLM=true` if you would
-rather have summaries and extracted items for X too.
+By default an X post is **extracted like a TikTok**: the model writes a title and
+summary and pulls out books, movies, and other items. Photos and (when present)
+video are downloaded to feed the model. Set `X_USE_LLM=false` if you would rather
+capture the post verbatim with no OpenRouter call — those notes are the post's
+own text, a `## Links` section, and a `## Media` section, and they are free.
 
 Photos, videos, and GIFs are all downloaded into `OBSIDIAN_ATTACHMENTS_DIR` (by
 default an `attachments` folder beside your notes) and embedded as `![[...]]`
@@ -121,10 +125,36 @@ Optional. Create an API token in Hardcover account settings and set `HARDCOVER_A
 New scoped tokens (August 2026+) need catalog search, own-library read, and
 `insert_user_book` write.
 
-On **Save** only, extracted `book` items (not low-confidence) are searched by title
-and author. A confident match that is not already on your shelf is added as Want to
-Read. Any existing status is left alone. Dismiss and failed matches do not write to
-Hardcover. Matched books get a `[hardcover](...)` link in the note.
+On **Save** only, extracted `book` items (not low-confidence) from **either** TikTok
+or X are searched by title and author. A confident match that is not already on your
+shelf is added as Want to Read. Any existing status is left alone. Dismiss and failed
+matches do not write to Hardcover. Matched books get a `[hardcover](...)` link in the
+note.
+
+## Letterboxd
+
+Optional. Run [letterboxd-middleman](../letterboxd-middleman) on the machine the phone
+is plugged into, then set `LETTERBOXD_MIDDLEMAN_URL` and `LETTERBOXD_MIDDLEMAN_API_KEY`
+(the same key as the middleman's `MIDDLEMAN_API_KEY`).
+
+From this bot's Docker container the URL is `http://letterboxd-middleman:8787` on the
+shared `media-ai` Compose network. Do not use `http://127.0.0.1:8787` (that is the bot
+container itself) and do not use `host.docker.internal` either: the middleman publishes
+port 8787 on the host loopback only, so the Docker gateway cannot reach it. Recreate
+**both** stacks after this change so they join the same network.
+
+On **Save** only, extracted `movie` items (not low-confidence, not TV `series`) from
+TikTok or X are posted to `POST /watchlist` as `{title, year?, director?}`. Year comes
+from the model when it knows it, otherwise from a trailing `(2010)` on the title or
+notes. Director is `creator_or_author`. A film already on the watchlist is left as-is.
+Dismiss, no match, and ambiguous results do not write. Matched films get a
+`[letterboxd](...)` link in the note.
+
+Appium can take tens of seconds per film, so the bot warns before a movie save and
+caps lookups at `LETTERBOXD_MOVIES_PER_JOB` (default 4).
+
+A save with only books never talks to Letterboxd. A save with only movies never talks
+to Hardcover. A mixed extract dispatches each item to its own service.
 
 ## Local CLI (optional)
 
@@ -145,8 +175,8 @@ even when the video is not:
 - `summary` — one to three sentences on what the video recommends
 - `video_kind` — `list` for roundups, `single` when the video is about one thing
 - `entities` — one per item, each with a category, exact `name`,
-  `creator_or_author`, short `notes`, `is_main_topic`, `confidence`, and an
-  optional `suggested_link`
+  `creator_or_author` (director for movies), optional `year`, short `notes`,
+  `is_main_topic`, `confidence`, and an optional `suggested_link`
 
 Categories: `tool` (software, apps, websites, services), `product`, `book`,
 `movie`, `series`, `album` (artist or band in `creator_or_author`), `video`
@@ -172,12 +202,17 @@ Notes on behaviour:
   directly. API failures fall back to the Kagi search link. This is billed separately
   ([~$12 / 1k searches](https://kagi.com/api/pricing); a $5 monthly credit is ~416 calls).
   `docker compose logs bot | grep kagi` shows each lookup.
-- If `HARDCOVER_API_KEY` is set, **Save** (or CLI `--save`) looks up extracted books on
-  [Hardcover](https://hardcover.app) and marks confident matches **Want to Read**. Books
-  already on your shelf (any status) are left unchanged. Dismiss never writes to Hardcover.
-  Unmatched or failed lookups still save the Obsidian note. New scoped tokens need catalog
-  search, own-library read, and `insert_user_book` write. `docker compose logs bot | grep hardcover`
-  shows each lookup.
+- If `HARDCOVER_API_KEY` is set, **Save** (or CLI `--save`) looks up extracted **books**
+  on [Hardcover](https://hardcover.app) from TikTok or X and marks confident matches
+  **Want to Read**. Books already on your shelf (any status) are left unchanged.
+  Dismiss never writes to Hardcover. Unmatched or failed lookups still save the
+  Obsidian note. New scoped tokens need catalog search, own-library read, and
+  `insert_user_book` write. `docker compose logs bot | grep hardcover` shows each lookup.
+- If `LETTERBOXD_MIDDLEMAN_URL` and `LETTERBOXD_MIDDLEMAN_API_KEY` are set, **Save**
+  posts extracted **movies** to letterboxd-middleman (`POST /watchlist`) and adds
+  confident matches to your Letterboxd watchlist. Films already on the list are left
+  unchanged. Dismiss never writes. `docker compose logs bot | grep letterboxd` shows
+  each lookup.
 - Items marked low confidence render as `_(uncertain)_`.
 - List videos render every item under `## Items`; single-topic videos lead with
   `## Recommendation` and push passing mentions to `## Also mentioned`. Each item
@@ -191,15 +226,16 @@ Notes on behaviour:
 2. Gather the source, temp only:
    - TikTok: `yt-dlp` download
    - X: post JSON from FxTwitter/VxTwitter plus link previews. Media is downloaded
-     here only when `X_USE_LLM=true`
-3. X with `X_USE_LLM=false` stops here and builds the note locally — steps 3-5 are skipped
+     here only when `X_USE_LLM=true` (the default)
+3. X with `X_USE_LLM=false` stops here and builds the note locally — steps 4-7 are skipped
 4. When there is video: `ffmpeg` → mono 16 kHz WAV for Whisper; sample ~8 JPEG frames
 5. `faster-whisper` `base` (CPU int8) → transcript kept **in memory only**
 6. OpenRouter multimodal → structured JSON (tools / books / movies / music)
 7. Optional: Kagi Search API fills a few missing item URLs (skipped without `KAGI_API_KEY`)
 8. Always delete temp job directory
 9. Telegram preview + save keyboard; photos are fetched into the vault on save
-10. On Save only: optional Hardcover lookup marks extracted books Want to Read
+10. On Save only: books → Hardcover Want to Read; movies → Letterboxd watchlist
+    (a type that is absent is skipped)
 
 ## Token cost controls
 
@@ -241,6 +277,7 @@ app/
   openrouter.py   Multimodal extraction client
   kagi.py         Optional Kagi Search API client (direct page URLs)
   hardcover.py    Optional Hardcover client (Want to Read on save)
+  letterboxd.py   Optional letterboxd-middleman client (watchlist on save)
   obsidian.py     Markdown renderer + atomic vault write
   config.py       Settings from env
   models.py       Schema + URL parsing

@@ -51,9 +51,8 @@ class Settings(BaseSettings):
         alias="OBSIDIAN_ATTACHMENTS_DIR",
     )
 
-    # X posts are mostly text and links, so the model earns its cost far less
-    # often than on a TikTok video. Off by default: notes are built locally.
-    x_use_llm: bool = Field(default=False, alias="X_USE_LLM")
+    # X posts run through the model like TikTok. Set false to save them verbatim.
+    x_use_llm: bool = Field(default=True, alias="X_USE_LLM")
     # Per-file ceiling for photos and videos copied into the vault
     max_attachment_mb: int = Field(
         default=100,
@@ -158,6 +157,27 @@ class Settings(BaseSettings):
         ge=1.0,
         le=60.0,
     )
+    # Optional. Empty URL or key = skip Letterboxd. Movies only, on Save.
+    letterboxd_middleman_url: str = Field(
+        default="",
+        alias="LETTERBOXD_MIDDLEMAN_URL",
+    )
+    letterboxd_middleman_api_key: str = Field(
+        default="",
+        alias="LETTERBOXD_MIDDLEMAN_API_KEY",
+    )
+    letterboxd_movies_per_job: int = Field(
+        default=4,
+        alias="LETTERBOXD_MOVIES_PER_JOB",
+        ge=0,
+        le=20,
+    )
+    letterboxd_timeout_seconds: float = Field(
+        default=180.0,
+        alias="LETTERBOXD_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=600.0,
+    )
     # Host used when building Amazon search links for product items.
     amazon_search_host: str = Field(
         default="www.amazon.com",
@@ -171,12 +191,24 @@ class Settings(BaseSettings):
     puid: int = Field(default=1000, alias="PUID")
     pgid: int = Field(default=1000, alias="PGID")
 
-    @field_validator("kagi_api_key", "hardcover_api_key", mode="before")
+    @field_validator(
+        "kagi_api_key",
+        "hardcover_api_key",
+        "letterboxd_middleman_api_key",
+        mode="before",
+    )
     @classmethod
     def strip_optional_api_key(cls, value: object) -> object:
         if value is None:
             return ""
         return str(value).strip()
+
+    @field_validator("letterboxd_middleman_url", mode="before")
+    @classmethod
+    def strip_letterboxd_url(cls, value: object) -> object:
+        if value is None:
+            return ""
+        return str(value).strip().rstrip("/")
 
     @field_validator("amazon_search_host", mode="before")
     @classmethod
