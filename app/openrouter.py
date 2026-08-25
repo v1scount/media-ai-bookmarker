@@ -50,6 +50,10 @@ Naming and links:
   clearly, shown on screen, or taken from a linked page title, "low" when you are
   inferring it.
 
+Title:
+- Write a short English title (about 80 characters) that names the topic.
+- No hashtags, no dates, no "TikTok" or "tweet", no clickbait leftover from the caption.
+
 Other rules:
 - Never include a full transcript or raw OCR dump.
 - Use "" for unknown text fields, never null.
@@ -60,8 +64,8 @@ Other rules:
 REPAIR_SYSTEM_PROMPT = """You fix malformed JSON.
 Return ONLY a JSON object, no markdown fences and no commentary."""
 
-# title, creator and source_url come from yt-dlp metadata, and the search query is
-# built locally, so the model is never asked for any of them.
+# creator and source_url come from source metadata. title is requested from the
+# model; the search query is still built locally.
 ENTITY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -149,8 +153,15 @@ RESULT_JSON_SCHEMA: dict[str, Any] = {
     "schema": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["summary", "video_kind", "entities"],
+        "required": ["title", "summary", "video_kind", "entities"],
         "properties": {
+            "title": {
+                "type": "string",
+                "description": (
+                    "Short English title for the note, about 80 characters. "
+                    "Name the topic; no hashtags, dates, or the word TikTok."
+                ),
+            },
             "summary": {
                 "type": "string",
                 "description": (
@@ -263,6 +274,7 @@ def _parse_result(raw: str, source_url: str) -> ExtractionResult:
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object")
     data.pop("source_kind", None)
+    data.pop("source_description", None)
     data["source_url"] = source_url
     return ExtractionResult.model_validate(data)
 
@@ -389,7 +401,7 @@ class OpenRouterClient:
                 "role": "user",
                 "content": (
                     "Fix this response so it matches the required schema "
-                    "(keys: summary, video_kind, entities; "
+                    "(keys: title, summary, video_kind, entities; "
                     "use \"\" instead of null for text fields).\n\n"
                     f"Validation error:\n{str(error)[:800]}\n\n"
                     f"Invalid response:\n{bad_content[:4000]}"

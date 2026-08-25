@@ -158,6 +158,11 @@ class Settings(BaseSettings):
         ge=1.0,
         le=60.0,
     )
+    # Host used when building Amazon search links for product items.
+    amazon_search_host: str = Field(
+        default="www.amazon.com",
+        alias="AMAZON_SEARCH_HOST",
+    )
     ytdlp_cookies_file: Path | None = Field(
         default=None,
         alias="YTDLP_COOKIES_FILE",
@@ -172,6 +177,13 @@ class Settings(BaseSettings):
         if value is None:
             return ""
         return str(value).strip()
+
+    @field_validator("amazon_search_host", mode="before")
+    @classmethod
+    def normalize_amazon_search_host(cls, value: object) -> object:
+        from app.models import normalize_amazon_host
+
+        return normalize_amazon_host(value)
 
     @field_validator("ytdlp_cookies_file", mode="before")
     @classmethod

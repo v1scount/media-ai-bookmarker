@@ -164,7 +164,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
     result_id = await _store_result(result)
-    preview = format_preview(result)
+    preview = format_preview(result, amazon_host=settings.amazon_search_host)
     # Telegram message limit ~4096; trim if needed
     if len(preview) > 3900:
         preview = preview[:3900] + "\n…"

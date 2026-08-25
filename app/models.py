@@ -38,6 +38,11 @@ X_STATUS_ID_RE = re.compile(r"/status(?:es)?/(\d+)", re.IGNORECASE)
 TRAILING_PUNCTUATION = ").,];>"
 
 SEARCH_URL_TEMPLATE = "https://kagi.com/search?q={query}"
+DEFAULT_AMAZON_SEARCH_HOST = "www.amazon.com"
+MERCADO_LIBRE_SEARCH_TEMPLATE = "https://listado.mercadolibre.com.ar/{slug}"
+AMAZON_SEARCH_TEMPLATE = "https://{host}/s?k={query}"
+EBAY_SEARCH_TEMPLATE = "https://www.ebay.com/sch/i.html?_nkw={query}"
+TRAILING_HASHTAGS_RE = re.compile(r"(?:(?:^|\s)#\w[\w.-]*)+$", re.UNICODE)
 
 
 class SourceKind(str, Enum):
@@ -131,6 +136,39 @@ def _none_to_empty(value: object) -> object:
     return "" if value is None else value
 
 
+def split_caption(text: str) -> tuple[str, str]:
+    """Split a trailing hashtag dump from the prose of a caption."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return "", ""
+    match = TRAILING_HASHTAGS_RE.search(cleaned)
+    if not match:
+        return cleaned, ""
+    tags = match.group(0).strip()
+    prose = cleaned[: match.start()].strip()
+    if not prose:
+        return "", tags
+    if len(re.findall(r"#\w", tags)) < 2:
+        return cleaned, ""
+    return prose, tags
+
+
+def normalize_amazon_host(value: object) -> str:
+    """Accept a bare host or a pasted Amazon URL and return just the host."""
+    text = str(value or DEFAULT_AMAZON_SEARCH_HOST).strip()
+    text = re.sub(r"^https?://", "", text, flags=re.IGNORECASE)
+    host = text.split("/")[0].strip().lower()
+    return host or DEFAULT_AMAZON_SEARCH_HOST
+
+
+def mercadolibre_slug(query: str) -> str:
+    """Hyphenated path segment used by listado.mercadolibre.com.ar."""
+    text = (query or "").lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    text = re.sub(r"[-\s]+", "-", text).strip("-")
+    return text or "producto"
+
+
 class Entity(BaseModel):
     type: EntityType = EntityType.other
     name: str
@@ -198,6 +236,32 @@ class Entity(BaseModel):
         """Plain web search for this item, built locally (no LLM research)."""
         return SEARCH_URL_TEMPLATE.format(query=quote_plus(self.search_query))
 
+    def shop_query(self) -> str:
+        """Name and brand only — no type hint. Used for store searches."""
+        return " ".join(
+            part for part in (self.name, self.creator_or_author) if part
+        ).strip()
+
+    def shop_links(
+        self, amazon_host: str = DEFAULT_AMAZON_SEARCH_HOST
+    ) -> list[tuple[str, str]]:
+        """Mercado Libre / Amazon / eBay search URLs. Empty unless this is a product."""
+        if self.type != EntityType.product:
+            return []
+        query = self.shop_query()
+        if not query:
+            return []
+        host = normalize_amazon_host(amazon_host)
+        quoted = quote_plus(query)
+        return [
+            (
+                "Mercado Libre",
+                MERCADO_LIBRE_SEARCH_TEMPLATE.format(slug=mercadolibre_slug(query)),
+            ),
+            ("Amazon", AMAZON_SEARCH_TEMPLATE.format(host=host, query=quoted)),
+            ("eBay", EBAY_SEARCH_TEMPLATE.format(query=quoted)),
+        ]
+
 
 class MediaKind(str, Enum):
     image = "image"
@@ -252,10 +316,12 @@ class PostContent(BaseModel):
 
 class ExtractionResult(BaseModel):
     source_url: str
-    # title, creator and source_kind come from the pipeline, never from the model
+    # creator, source_kind and source_description come from the pipeline.
+    # title is written by the model on the LLM path, with a metadata fallback.
     source_kind: SourceKind = SourceKind.tiktok
     title: str = ""
     creator: str = ""
+    source_description: str = ""
     summary: str = ""
     video_kind: VideoKind = VideoKind.other
     entities: list[Entity] = Field(default_factory=list)
@@ -277,7 +343,9 @@ class ExtractionResult(BaseModel):
                 return SourceKind.tiktok
         return SourceKind.tiktok if value is None else value
 
-    @field_validator("title", "creator", "summary", "source_url", mode="before")
+    @field_validator(
+        "title", "creator", "summary", "source_url", "source_description", mode="before"
+    )
     @classmethod
     def coerce_null_strings(cls, value: object) -> object:
         return _none_to_empty(value)
@@ -303,6 +371,15 @@ class ExtractionResult(BaseModel):
         main = [entity for entity in self.entities if entity.is_main_topic]
         rest = [entity for entity in self.entities if not entity.is_main_topic]
         return main + rest
+
+    def entity_type_tags(self) -> list[str]:
+        """Distinct entity types, in note order, for frontmatter tags."""
+        seen: list[str] = []
+        for entity in self.ordered_entities():
+            value = entity.type.value
+            if value not in seen:
+                seen.append(value)
+        return seen
 
 
 def extract_tiktok_url(text: str) -> Optional[str]:

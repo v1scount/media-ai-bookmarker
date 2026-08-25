@@ -40,6 +40,7 @@ cp .env.example .env
 | `KAGI_SEARCH_PER_JOB` | Max Kagi API searches per video (default `3`; `0` disables the API) |
 | `HARDCOVER_API_KEY` | Optional. From [Hardcover API settings](https://docs.hardcover.app/api/getting-started/). Empty = skip Hardcover |
 | `HARDCOVER_BOOKS_PER_JOB` | Max books to look up per save (default `8`; `0` disables) |
+| `AMAZON_SEARCH_HOST` | Host for product Amazon search links (default `www.amazon.com`) |
 
 3. Discover your Telegram user id: message the bot with `/whoami` (no allowlist needed), or use [@userinfobot](https://t.me/userinfobot). Put that number in `ALLOWED_TELEGRAM_USER_IDS`.
 
@@ -60,7 +61,7 @@ docker compose up -d --build
 
 Notes are written to:
 
-`$OBSIDIAN_VAULT_PATH/$OBSIDIAN_RELATIVE_DIR/YYYY-MM-DD-slug.md`
+`$OBSIDIAN_VAULT_PATH/$OBSIDIAN_RELATIVE_DIR/{Note title}.md`
 
 ## TikTok download troubleshooting
 
@@ -140,6 +141,7 @@ docker compose exec bot python -m app.cli "https://x.com/user/status/123"
 The model is asked for things worth looking up later, always answered in English
 even when the video is not:
 
+- `title` — a short English title the model writes for the note
 - `summary` — one to three sentences on what the video recommends
 - `video_kind` — `list` for roundups, `single` when the video is about one thing
 - `entities` — one per item, each with a category, exact `name`,
@@ -153,13 +155,17 @@ Categories: `tool` (software, apps, websites, services), `product`, `book`,
 
 Notes on behaviour:
 
-- The note title is always the original TikTok caption, or the first line of the X
-  post with links stripped; the model never rewrites it.
+- The note title is written by the model (short, English, no hashtags). The original
+  TikTok caption or description is kept in a quote callout under the title. Raw X notes
+  still use the first line of the post as the title.
+- Filenames use that title as-is (spaces kept, no date prefix). Characters illegal on
+  Windows are stripped.
 - `suggested_link` is only filled when the model is confident. For X posts the
-  expanded links are handed to the model, so they can be used verbatim. Otherwise the note
-  gets a [Kagi](https://kagi.com) search link built locally from the name and author, so
-  nothing is ever guessed and no research tokens are spent. Clicking that link uses your
-  unlimited Kagi subscription in the browser.
+  expanded links are handed to the model, so they can be used verbatim. Otherwise
+  non-product items get a [Kagi](https://kagi.com) search link built locally from the
+  name and author, so nothing is ever guessed and no research tokens are spent.
+  Product items get Mercado Libre Argentina, Amazon, and eBay search links instead.
+  Clicking a Kagi link uses your unlimited Kagi subscription in the browser.
 - If `KAGI_API_KEY` is set, the bot also calls the [Kagi Search API](https://help.kagi.com/kagi/api/search.html)
   for up to `KAGI_SEARCH_PER_JOB` items (default 3; skips low-confidence and items that
   already have a link). A hit becomes `[link](the top result)` so the note opens that page
@@ -174,7 +180,10 @@ Notes on behaviour:
   shows each lookup.
 - Items marked low confidence render as `_(uncertain)_`.
 - List videos render every item under `## Items`; single-topic videos lead with
-  `## Recommendation` and push passing mentions to `## Also mentioned`.
+  `## Recommendation` and push passing mentions to `## Also mentioned`. Each item
+  is a heading with notes as a paragraph and links as a list.
+- Frontmatter `tags` include the source plus each distinct entity type
+  (`product`, `book`, …).
 
 ## Pipeline
 
