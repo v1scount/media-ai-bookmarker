@@ -12,6 +12,9 @@ from pathlib import Path
 from app.config import Settings
 from app.kagi import KagiClient, select_kagi_candidates
 from app.models import (
+    DEFAULT_AMAZON_SEARCH_HOST,
+    Entity,
+    EntityType,
     ExtractionResult,
     LinkRef,
     MediaKind,
@@ -20,6 +23,7 @@ from app.models import (
     SourceKind,
     extract_status_id,
     extract_supported_url,
+    split_caption,
 )
 from app.openrouter import OpenRouterClient
 from app.xfetch import LinkPreview, TweetData
@@ -159,6 +163,7 @@ class Pipeline:
                 source_kind=artifacts.source_kind,
                 title=artifacts.title,
                 creator=artifacts.creator,
+                source_description=artifacts.description or artifacts.title,
                 post=artifacts.post,
             )
             self._cache_put(url, result)
@@ -195,6 +200,7 @@ class Pipeline:
                 source_kind=artifacts.source_kind,
                 title=artifacts.title,
                 creator=artifacts.creator,
+                source_description=artifacts.description or artifacts.title,
                 summary=_empty_source_summary(artifacts.source_kind),
                 entities=[],
             )
@@ -210,11 +216,7 @@ class Pipeline:
             link_previews=artifacts.link_previews,
             source_kind=artifacts.source_kind,
         )
-        # Title, creator and source always come from metadata, not the model
-        result.source_url = url
-        result.source_kind = artifacts.source_kind
-        result.title = artifacts.title
-        result.creator = artifacts.creator
+        apply_source_metadata(result, url, artifacts)
 
         await self._enrich_with_kagi(result, progress)
 
@@ -581,6 +583,18 @@ def detect_source_kind(url: str) -> SourceKind:
     return match[0] if match else SourceKind.tiktok
 
 
+def apply_source_metadata(
+    result: ExtractionResult, url: str, artifacts: SourceArtifacts
+) -> None:
+    """Stamp pipeline-owned fields. Keep a model title when one was returned."""
+    result.source_url = url
+    result.source_kind = artifacts.source_kind
+    result.creator = artifacts.creator
+    result.source_description = artifacts.description or artifacts.title
+    if not result.title.strip():
+        result.title = artifacts.title
+
+
 def canonical_x_url(handle: str, tweet_id: str) -> str:
     """An x.com URL yt-dlp understands, whichever mirror domain was pasted."""
     name = (handle or "").lstrip("@")
@@ -656,7 +670,10 @@ def _empty_source_summary(kind: SourceKind) -> str:
     )
 
 
-def format_preview(result: ExtractionResult) -> str:
+def format_preview(
+    result: ExtractionResult,
+    amazon_host: str = DEFAULT_AMAZON_SEARCH_HOST,
+) -> str:
     from app.models import Confidence
 
     fallback = "X extract" if result.source_kind == SourceKind.x else "TikTok extract"
@@ -666,11 +683,18 @@ def format_preview(result: ExtractionResult) -> str:
     lines = [
         f"<b>{_html(result.title or fallback)}</b>",
         f"by {_html(result.creator or 'unknown')}",
-        "",
-        _html(result.summary or "(no summary)"),
-        "",
-        "<b>Items</b>",
     ]
+    excerpt = _caption_excerpt(result.source_description)
+    if excerpt:
+        lines.extend(["", _html(excerpt)])
+    lines.extend(
+        [
+            "",
+            _html(result.summary or "(no summary)"),
+            "",
+            "<b>Items</b>",
+        ]
+    )
     entities = result.ordered_entities()
     if not entities:
         lines.append("<i>Nothing worth looking up was found.</i>")
@@ -680,18 +704,42 @@ def format_preview(result: ExtractionResult) -> str:
                 f" ({_html(ent.creator_or_author)})" if ent.creator_or_author else ""
             )
             star = "* " if ent.is_main_topic else ""
-            if ent.suggested_link:
-                link = f' — <a href="{_html(ent.suggested_link)}">link</a>'
-            else:
-                link = f' — <a href="{_html(ent.search_url)}">search</a>'
+            links = _preview_entity_links(ent, amazon_host)
             uncertain = " <i>(uncertain)</i>" if ent.confidence == Confidence.low else ""
             notes = f"\n  <i>{_html(ent.notes)}</i>" if ent.notes else ""
             lines.append(
                 f"• {star}<b>{_html(ent.type.value)}</b> — {_html(ent.name)}"
-                f"{author}{link}{uncertain}{notes}"
+                f"{author}{links}{uncertain}{notes}"
             )
     lines.extend(["", f'<a href="{_html(result.source_url)}">Source</a>'])
     return "\n".join(lines)
+
+
+def _caption_excerpt(text: str, limit: int = 200) -> str:
+    prose, _tags = split_caption(text)
+    snippet = (prose or text).strip()
+    if not snippet:
+        return ""
+    first_line = snippet.splitlines()[0].strip()
+    if len(first_line) > limit:
+        return first_line[: limit - 1] + "…"
+    return first_line
+
+
+def _preview_entity_links(entity: Entity, amazon_host: str) -> str:
+    parts: list[str] = []
+    if entity.suggested_link:
+        parts.append(f'<a href="{_html(entity.suggested_link)}">link</a>')
+    if entity.type == EntityType.product:
+        for label, url in entity.shop_links(amazon_host):
+            parts.append(f'<a href="{_html(url)}">{_html(label)}</a>')
+    elif not entity.suggested_link:
+        parts.append(f'<a href="{_html(entity.search_url)}">search</a>')
+    if entity.hardcover_url:
+        parts.append(f'<a href="{_html(entity.hardcover_url)}">hardcover</a>')
+    if not parts:
+        return ""
+    return " — " + " — ".join(parts)
 
 
 def _format_raw_preview(result: ExtractionResult, fallback: str) -> str:

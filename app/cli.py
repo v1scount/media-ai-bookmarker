@@ -48,7 +48,7 @@ async def _run(url: str, save: bool) -> int:
         print(json.dumps(result.model_dump(mode="json"), indent=2, ensure_ascii=False))
         print("\n--- Telegram-style preview ---\n")
         # Strip HTML tags roughly for console
-        preview = format_preview(result)
+        preview = format_preview(result, amazon_host=settings.amazon_search_host)
         print(preview.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<code>", "`").replace("</code>", "`"))
         if save:
             path, actions = await sync_hardcover_then_save(

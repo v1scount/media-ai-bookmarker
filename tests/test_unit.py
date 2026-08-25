@@ -33,6 +33,7 @@ from app.models import (
     extract_supported_url,
     extract_tiktok_url,
     extract_x_url,
+    split_caption,
 )
 from app.obsidian import build_note_filename, render_markdown, save_to_obsidian
 from app.openrouter import RESULT_JSON_SCHEMA, truncate_text
@@ -101,6 +102,19 @@ class AllowedIdsTests(unittest.TestCase):
         self.assertEqual(settings.kagi_api_key, "")
         self.assertEqual(settings.kagi_search_per_job, 3)
         self.assertEqual(settings.kagi_timeout_seconds, 15.0)
+
+    def test_amazon_search_host_default_and_strip(self) -> None:
+        settings = Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+        )
+        self.assertEqual(settings.amazon_search_host, "www.amazon.com")
+        custom = Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+            AMAZON_SEARCH_HOST="https://www.amazon.es/s",
+        )
+        self.assertEqual(custom.amazon_search_host, "www.amazon.es")
 
 
 class UrlParseTests(unittest.TestCase):
@@ -274,6 +288,52 @@ class ExtractionSchemaTests(unittest.TestCase):
         )
         self.assertEqual(entity.search_query, "Dune Frank Herbert book")
 
+    def test_product_shop_links_are_store_searches(self) -> None:
+        product = Entity.model_validate(
+            {
+                "type": "product",
+                "name": "FlexiSpot E7",
+                "creator_or_author": "FlexiSpot",
+            }
+        )
+        links = dict(product.shop_links())
+        self.assertEqual(
+            links["Mercado Libre"],
+            "https://listado.mercadolibre.com.ar/flexispot-e7-flexispot",
+        )
+        self.assertEqual(
+            links["Amazon"],
+            "https://www.amazon.com/s?k=FlexiSpot+E7+FlexiSpot",
+        )
+        self.assertEqual(
+            links["eBay"],
+            "https://www.ebay.com/sch/i.html?_nkw=FlexiSpot+E7+FlexiSpot",
+        )
+        self.assertNotIn("product", product.shop_query().lower())
+
+        book = Entity.model_validate(
+            {"type": "book", "name": "Dune", "creator_or_author": "Frank Herbert"}
+        )
+        self.assertEqual(book.shop_links(), [])
+
+    def test_product_shop_links_honour_amazon_host(self) -> None:
+        product = Entity(type=EntityType.product, name="Desk")
+        links = dict(product.shop_links(amazon_host="www.amazon.es"))
+        self.assertEqual(links["Amazon"], "https://www.amazon.es/s?k=Desk")
+
+    def test_source_description_coerced(self) -> None:
+        result = ExtractionResult.model_validate(
+            {"source_url": "u", "source_description": None}
+        )
+        self.assertEqual(result.source_description, "")
+
+    def test_split_caption_moves_trailing_hashtags(self) -> None:
+        prose, tags = split_caption("Original TikTok caption #dune #books")
+        self.assertEqual(prose, "Original TikTok caption")
+        self.assertEqual(tags, "#dune #books")
+        self.assertEqual(split_caption("Just a sentence."), ("Just a sentence.", ""))
+        self.assertEqual(split_caption("#only #tags"), ("", "#only #tags"))
+
     def test_main_topic_sorted_first(self) -> None:
         result = ExtractionResult.model_validate(
             {
@@ -302,9 +362,11 @@ class TokenGuardTests(unittest.TestCase):
         schema = RESULT_JSON_SCHEMA["schema"]
         self.assertTrue(RESULT_JSON_SCHEMA["strict"])
         self.assertFalse(schema["additionalProperties"])
-        # Metadata we already know locally is never requested from the model
-        for field in ("source_url", "title", "creator", "source_kind"):
+        # Pipeline-owned metadata is never requested from the model
+        for field in ("source_url", "creator", "source_kind", "source_description"):
             self.assertNotIn(field, schema["properties"])
+        self.assertIn("title", schema["properties"])
+        self.assertIn("title", schema["required"])
 
     def test_every_schema_field_is_documented(self) -> None:
         entity_props = RESULT_JSON_SCHEMA["schema"]["properties"]["entities"]["items"][
@@ -313,6 +375,7 @@ class TokenGuardTests(unittest.TestCase):
         for name, spec in entity_props.items():
             self.assertIn("description", spec, name)
         self.assertNotIn("search_query", entity_props)
+        self.assertIn("description", RESULT_JSON_SCHEMA["schema"]["properties"]["title"])
 
     def test_hamming_distance(self) -> None:
         self.assertEqual(hamming_distance(0b1011, 0b1001), 1)
@@ -393,7 +456,8 @@ class ObsidianTests(unittest.TestCase):
     def test_single_topic_note_leads_with_recommendation(self) -> None:
         result = ExtractionResult(
             source_url="https://www.tiktok.com/@u/video/1",
-            title="Original TikTok caption",
+            title="A novel worth reading",
+            source_description="Original TikTok caption #dune #books",
             creator="creator1",
             summary="Recommends a novel.",
             video_kind=VideoKind.single,
@@ -410,12 +474,94 @@ class ObsidianTests(unittest.TestCase):
             ],
         )
         md = render_markdown(result)
-        # The TikTok caption is preserved verbatim as the note title
-        self.assertIn("# Original TikTok caption", md)
+        self.assertIn("# A novel worth reading", md)
+        self.assertIn("> [!quote] Original caption", md)
+        self.assertIn("> Original TikTok caption", md)
+        self.assertIn("> #dune #books", md)
+        self.assertNotIn("# Original TikTok caption", md)
         self.assertIn("kind: single", md)
         self.assertIn("## Recommendation", md)
         self.assertIn("## Also mentioned", md)
+        self.assertIn("### Book — Dune", md)
+        self.assertIn("*Frank Herbert*", md)
         self.assertIn("[search](https://kagi.com/search?q=Dune+", md)
+        self.assertIn("## Source", md)
+        self.assertIn("tags: [tiktok, extract, book, tool]", md)
+
+    def test_product_note_uses_store_searches(self) -> None:
+        result = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Standing desk setup",
+            source_description="My compact desk setup",
+            video_kind=VideoKind.single,
+            entities=[
+                Entity(
+                    type=EntityType.product,
+                    name="FlexiSpot E7",
+                    creator_or_author="FlexiSpot",
+                    notes="Main pick for a small apartment",
+                    is_main_topic=True,
+                    suggested_link="https://www.flexispot.com/e7",
+                )
+            ],
+        )
+        md = render_markdown(result)
+        self.assertIn("### Product — FlexiSpot E7", md)
+        self.assertIn("[link](https://www.flexispot.com/e7)", md)
+        self.assertIn(
+            "[Mercado Libre](https://listado.mercadolibre.com.ar/flexispot-e7-flexispot)",
+            md,
+        )
+        self.assertIn("[Amazon](https://www.amazon.com/s?k=FlexiSpot+E7+FlexiSpot)", md)
+        self.assertIn(
+            "[eBay](https://www.ebay.com/sch/i.html?_nkw=FlexiSpot+E7+FlexiSpot)",
+            md,
+        )
+        self.assertNotIn("[search](https://kagi.com/search", md)
+
+    def test_preview_shows_caption_and_store_links(self) -> None:
+        result = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Standing desk setup",
+            creator="creator1",
+            source_description="My compact desk setup\nMore detail #desk #home",
+            summary="Recommends a desk.",
+            video_kind=VideoKind.single,
+            entities=[
+                Entity(
+                    type=EntityType.product,
+                    name="FlexiSpot E7",
+                    creator_or_author="FlexiSpot",
+                    is_main_topic=True,
+                )
+            ],
+        )
+        preview = format_preview(result)
+        self.assertIn("<b>Standing desk setup</b>", preview)
+        self.assertIn("My compact desk setup", preview)
+        self.assertIn("Mercado Libre", preview)
+        self.assertIn("Amazon", preview)
+        self.assertIn("eBay", preview)
+        self.assertNotIn("kagi.com/search", preview)
+
+    def test_filename_keeps_title_case_and_spaces(self) -> None:
+        result = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Standing desk for a small apartment",
+        )
+        self.assertEqual(
+            build_note_filename(result),
+            "Standing desk for a small apartment.md",
+        )
+
+    def test_filename_strips_illegal_characters(self) -> None:
+        result = ExtractionResult(
+            source_url="u",
+            title='A "quoted" post: part 2?',
+        )
+        name = build_note_filename(result)
+        self.assertEqual(name, "A quoted post part 2.md")
+        self.assertNotRegex(name, r"\d{4}-\d{2}-\d{2}")
 
     def test_low_confidence_marked(self) -> None:
         result = ExtractionResult(
@@ -449,7 +595,7 @@ class ObsidianTests(unittest.TestCase):
         )
         md = render_markdown(result)
         self.assertIn("Dune", md)
-        self.assertIn("tags: [tiktok, extract]", md)
+        self.assertIn("tags: [tiktok, extract, book]", md)
         self.assertNotIn("transcript", md.lower())
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -532,11 +678,11 @@ class ObsidianTests(unittest.TestCase):
             source_kind=SourceKind.x,
             title="!!!",
         )
-        self.assertIn("x-extract", build_note_filename(result))
+        self.assertEqual(build_note_filename(result), "X extract.md")
 
     def test_tiktok_filename_slug_fallback(self) -> None:
         result = ExtractionResult(source_url="u", title="!!!")
-        self.assertIn("tiktok-extract", build_note_filename(result))
+        self.assertEqual(build_note_filename(result), "TikTok extract.md")
 
 
 FX_TWEET_FIXTURE = {
@@ -737,6 +883,9 @@ class PipelineXRunTests(unittest.IsolatedAsyncioTestCase):
             pipeline._download.assert_not_called()
             self.assertEqual(result.source_kind, SourceKind.x)
             self.assertEqual(result.title, "Hello")
+            self.assertEqual(
+                result.source_description, "Hello https://example.com/article"
+            )
 
 
 class PostContentTests(unittest.TestCase):
@@ -815,6 +964,12 @@ class RawNoteTests(unittest.TestCase):
         # No AI sections when nothing was extracted
         self.assertNotIn("## Items", md)
         self.assertNotIn("## Recommendation", md)
+
+    def test_filename_uses_readable_title(self) -> None:
+        self.assertEqual(
+            build_note_filename(self._result()),
+            "Worth reading this.md",
+        )
 
     def test_note_omits_meaningless_kind_property(self) -> None:
         md = render_markdown(self._result())
@@ -1027,6 +1182,73 @@ class RawPipelineTests(unittest.IsolatedAsyncioTestCase):
             openrouter.extract.assert_awaited()
             self.assertFalse(result.is_raw_capture)
             self.assertEqual(result.summary, "A tweet.")
+            self.assertEqual(result.title, "Hello")
+            self.assertEqual(result.source_description, "Hello there")
+
+    async def test_keeps_model_title_and_full_description(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(tmp, use_llm=True)
+            openrouter = MagicMock()
+            openrouter.extract = AsyncMock(
+                return_value=ExtractionResult(
+                    source_url="https://x.com/u/status/1",
+                    title="A better title",
+                    summary="A tweet.",
+                )
+            )
+            pipeline = Pipeline(settings, openrouter)
+            pipeline._download_x = MagicMock(
+                return_value=SourceArtifacts(
+                    work_dir=Path(tmp),
+                    source_kind=SourceKind.x,
+                    title="Hello #tags #more",
+                    creator="@u",
+                    description="Hello there with a long caption #tags #more",
+                    source_id="1",
+                    post=PostContent(text="Hello there with a long caption #tags #more"),
+                )
+            )
+
+            result = await pipeline.run("https://x.com/u/status/1")
+
+            self.assertEqual(result.title, "A better title")
+            self.assertEqual(
+                result.source_description,
+                "Hello there with a long caption #tags #more",
+            )
+
+    async def test_empty_tiktok_attaches_description(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(tmp, use_llm=True)
+            openrouter = MagicMock()
+            openrouter.extract = AsyncMock(
+                side_effect=AssertionError("model must not be called")
+            )
+            pipeline = Pipeline(settings, openrouter)
+            pipeline._download = MagicMock(
+                return_value=SourceArtifacts(
+                    work_dir=Path(tmp),
+                    source_kind=SourceKind.tiktok,
+                    title="caption",
+                    description="full long description #desk #home",
+                    source_id="1",
+                )
+            )
+            pipeline._download_x = MagicMock(
+                side_effect=AssertionError("X download should not run")
+            )
+
+            result = await pipeline.run("https://www.tiktok.com/@u/video/1")
+
+            openrouter.extract.assert_not_awaited()
+            self.assertEqual(result.title, "caption")
+            self.assertEqual(
+                result.source_description, "full long description #desk #home"
+            )
 
 
 class KagiClientTests(unittest.TestCase):
