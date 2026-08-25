@@ -21,9 +21,14 @@ from app.config import get_settings
 from app.hardcover import (
     HardcoverClient,
     format_hardcover_report,
-    sync_hardcover_then_save,
+    sync_then_save,
 )
 from app.kagi import KagiClient
+from app.letterboxd import (
+    LetterboxdClient,
+    format_letterboxd_report,
+    select_letterboxd_candidates,
+)
 from app.models import ExtractionResult, extract_supported_url
 from app.obsidian import relative_vault_path
 from app.openrouter import OpenRouterClient
@@ -225,8 +230,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             hardcover: HardcoverClient | None = context.application.bot_data.get(
                 "hardcover"
             )
-            path, actions = await sync_hardcover_then_save(
-                settings, hardcover, result
+            letterboxd: LetterboxdClient | None = context.application.bot_data.get(
+                "letterboxd"
+            )
+            if (
+                query.message
+                and letterboxd is not None
+                and letterboxd.enabled
+                and select_letterboxd_candidates(
+                    result.entities, settings.letterboxd_movies_per_job
+                )
+            ):
+                await query.message.reply_text(
+                    "Saving… Letterboxd can take a minute."
+                )
+            path, hardcover_actions, letterboxd_actions = await sync_then_save(
+                settings, hardcover, result, letterboxd
             )
             rel = relative_vault_path(settings, path)
             await _pop_result(result_id)
@@ -236,9 +255,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 pass
             if query.message:
                 lines = [f"Saved to Obsidian:\n`{rel}`"]
-                report = format_hardcover_report(actions)
-                if report:
-                    lines.extend(["", report])
+                for report in (
+                    format_hardcover_report(hardcover_actions),
+                    format_letterboxd_report(letterboxd_actions),
+                ):
+                    if report:
+                        lines.extend(["", report])
                 await query.message.reply_text(
                     "\n".join(lines),
                     parse_mode=ParseMode.MARKDOWN,
@@ -261,11 +283,13 @@ async def post_init(application: Application) -> None:
     openrouter = OpenRouterClient(settings)
     kagi = KagiClient(settings)
     hardcover = HardcoverClient(settings)
+    letterboxd = LetterboxdClient(settings)
     pipeline = Pipeline(settings, openrouter, kagi)
     application.bot_data["settings"] = settings
     application.bot_data["openrouter"] = openrouter
     application.bot_data["kagi"] = kagi
     application.bot_data["hardcover"] = hardcover
+    application.bot_data["letterboxd"] = letterboxd
     application.bot_data["pipeline"] = pipeline
     application.bot_data["job_lock"] = asyncio.Lock()
     # Checked once so we never upload frames to a text-only model
@@ -296,6 +320,9 @@ async def post_shutdown(application: Application) -> None:
     hardcover: HardcoverClient | None = application.bot_data.get("hardcover")
     if hardcover:
         await hardcover.aclose()
+    letterboxd: LetterboxdClient | None = application.bot_data.get("letterboxd")
+    if letterboxd:
+        await letterboxd.aclose()
 
 
 def main() -> None:

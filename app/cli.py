@@ -18,9 +18,10 @@ from app.config import get_settings
 from app.hardcover import (
     HardcoverClient,
     format_hardcover_report,
-    sync_hardcover_then_save,
+    sync_then_save,
 )
 from app.kagi import KagiClient
+from app.letterboxd import LetterboxdClient, format_letterboxd_report
 from app.models import extract_supported_url
 from app.obsidian import relative_vault_path
 from app.openrouter import OpenRouterClient
@@ -37,6 +38,7 @@ async def _run(url: str, save: bool) -> int:
     openrouter = OpenRouterClient(settings)
     kagi = KagiClient(settings)
     hardcover = HardcoverClient(settings)
+    letterboxd = LetterboxdClient(settings)
     pipeline = Pipeline(settings, openrouter, kagi)
     try:
         pipeline.model_supports_images = await openrouter.verify_model()
@@ -51,18 +53,22 @@ async def _run(url: str, save: bool) -> int:
         preview = format_preview(result, amazon_host=settings.amazon_search_host)
         print(preview.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<code>", "`").replace("</code>", "`"))
         if save:
-            path, actions = await sync_hardcover_then_save(
-                settings, hardcover, result
+            path, hardcover_actions, letterboxd_actions = await sync_then_save(
+                settings, hardcover, result, letterboxd
             )
             print(f"\nSaved: {relative_vault_path(settings, path)}")
-            report = format_hardcover_report(actions)
-            if report:
-                print(report)
+            for report in (
+                format_hardcover_report(hardcover_actions),
+                format_letterboxd_report(letterboxd_actions),
+            ):
+                if report:
+                    print(report)
         return 0
     finally:
         await openrouter.aclose()
         await kagi.aclose()
         await hardcover.aclose()
+        await letterboxd.aclose()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -14,6 +14,11 @@ services:
       - job-tmp:/tmp/tiktok-jobs
       # Optional Netscape cookies.txt for TikTok (export from browser)
       - ./cookies.txt:/config/cookies.txt:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - media-ai
     environment:
       OBSIDIAN_VAULT_PATH: /vault
       WHISPER_DOWNLOAD_ROOT: /models
@@ -25,3 +30,7 @@ services:
 volumes:
   whisper-models:
   job-tmp:
+
+networks:
+  media-ai:
+    name: media-ai

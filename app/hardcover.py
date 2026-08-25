@@ -12,6 +12,12 @@ from typing import Any, Optional
 import httpx
 
 from app.config import Settings
+from app.letterboxd import (
+    LetterboxdAction,
+    LetterboxdClient,
+    apply_letterboxd_actions,
+    select_letterboxd_candidates,
+)
 from app.models import Confidence, Entity, EntityType, ExtractionResult
 from app.obsidian import save_to_obsidian
 
@@ -456,15 +462,41 @@ class HardcoverClient:
         return payload
 
 
+async def sync_then_save(
+    settings: Settings,
+    hardcover: HardcoverClient | None,
+    result: ExtractionResult,
+    letterboxd: LetterboxdClient | None = None,
+) -> tuple[Path, list[HardcoverAction], list[LetterboxdAction]]:
+    """Dispatch by entity type, then write the Obsidian note. Fail-soft.
+
+    Books go to Hardcover; movies go to Letterboxd. A service is not called
+    when that type is absent (or the client is disabled). Mixed extracts hit
+    both. Tools and other types stay in the note only.
+    """
+    hardcover_actions: list[HardcoverAction] = []
+    letterboxd_actions: list[LetterboxdAction] = []
+    if hardcover is not None and hardcover.enabled:
+        if select_hardcover_candidates(
+            result.entities, settings.hardcover_books_per_job
+        ):
+            hardcover_actions = await hardcover.sync_books(result.entities)
+            apply_hardcover_actions(result.entities, hardcover_actions)
+    if letterboxd is not None and letterboxd.enabled:
+        if select_letterboxd_candidates(
+            result.entities, settings.letterboxd_movies_per_job
+        ):
+            letterboxd_actions = await letterboxd.sync_movies(result.entities)
+            apply_letterboxd_actions(result.entities, letterboxd_actions)
+    path = await asyncio.to_thread(save_to_obsidian, settings, result)
+    return path, hardcover_actions, letterboxd_actions
+
+
 async def sync_hardcover_then_save(
     settings: Settings,
     hardcover: HardcoverClient | None,
     result: ExtractionResult,
 ) -> tuple[Path, list[HardcoverAction]]:
-    """Want-to-Read matched books, then write the Obsidian note. Fail-soft."""
-    actions: list[HardcoverAction] = []
-    if hardcover is not None and hardcover.enabled:
-        actions = await hardcover.sync_books(result.entities)
-        apply_hardcover_actions(result.entities, actions)
-    path = await asyncio.to_thread(save_to_obsidian, settings, result)
+    """Books-only wrapper around sync_then_save."""
+    path, actions, _letterboxd = await sync_then_save(settings, hardcover, result)
     return path, actions
