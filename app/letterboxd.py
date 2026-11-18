@@ -1,7 +1,8 @@
 """Optional Letterboxd watchlist sync via letterboxd-middleman.
 
-Mirrors app.hardcover: Save-only, fail-soft, movies only. Matching lives in
-the middleman; this client posts title/year/director and records the outcome.
+Mirrors app.hardcover: runs after extraction, fail-soft, movies only.
+Matching lives in the middleman; this client posts title/year/director and
+records the outcome. The Obsidian note is a separate optional step.
 """
 
 from __future__ import annotations

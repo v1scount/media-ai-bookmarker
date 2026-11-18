@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
-from app.models import ExtractionResult, SourceKind
+from app.models import Entity, ExtractionResult, SourceKind
 from app.xfetch import LinkPreview
 
 logger = logging.getLogger(__name__)
@@ -42,8 +42,11 @@ How thorough to be:
 - When a post is mostly a link, the linked page is usually the main topic.
 
 Naming and links:
-- Give the exact name. Put the author, artist, band, studio, or channel in creator_or_author.
-  For movies, creator_or_author is the director.
+- Give the exact name as shown or stated. Put the author, artist, band, studio, or
+  channel in creator_or_author. For movies, creator_or_author is the director.
+- For books, if the source uses a translated title and you also know the original or
+  English catalog title, put that in alternate_names. Do not guess. Do not combine
+  both titles in name. For movies and other types, leave alternate_names empty.
 - year is the release year for a movie, and for a book when it is stated. Otherwise null.
   Never guess a year.
 - suggested_link only for a URL you are confident is correct: prefer a URL given to
@@ -67,6 +70,36 @@ Other rules:
 REPAIR_SYSTEM_PROMPT = """You fix malformed JSON.
 Return ONLY a JSON object, no markdown fences and no commentary."""
 
+CATALOG_TITLE_SYSTEM_PROMPT = """You map a book to the title English-language catalogs use.
+
+The supplied title may be a translation or a local edition title, often with a
+subtitle added only for that edition. Return catalog_title as the short English
+title, or the original title when catalogs keep the original. Leave off
+annotated editions, summaries, study guides, and locally added subtitles.
+
+Return an empty string when the supplied title is already that catalog title,
+or when you are not sure it is the same book. Do not invent a different work
+by the same author."""
+
+CATALOG_TITLE_SCHEMA: dict[str, Any] = {
+    "name": "book_catalog_title",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["catalog_title"],
+        "properties": {
+            "catalog_title": {
+                "type": "string",
+                "description": (
+                    "Short English or original catalog title. Empty when the "
+                    "supplied title is already that title, or when unsure."
+                ),
+            },
+        },
+    },
+}
+
 # creator and source_url come from source metadata. title is requested from the
 # model; the search query is still built locally.
 ENTITY_SCHEMA: dict[str, Any] = {
@@ -81,6 +114,7 @@ ENTITY_SCHEMA: dict[str, Any] = {
         "confidence",
         "suggested_link",
         "year",
+        "alternate_names",
     ],
     "properties": {
         "type": {
@@ -153,6 +187,15 @@ ENTITY_SCHEMA: dict[str, Any] = {
             "description": (
                 "Release year for a movie, and for a book when stated. "
                 "Null when unknown or the item has no year. Never guess."
+            ),
+        },
+        "alternate_names": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Other known titles, especially a book's original or English "
+                "catalog title when name is a translation. Empty array when "
+                "unknown. Do not guess. Leave empty for movies and other types."
             ),
         },
     },
@@ -277,6 +320,20 @@ def _strip_code_fence(text: str) -> str:
     if fence:
         return fence.group(1).strip()
     return text
+
+
+def parse_catalog_title(raw: str) -> str:
+    """Catalog title from the translation call. Empty when missing or invalid."""
+    try:
+        data = json.loads(_strip_code_fence(raw))
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    title = data.get("catalog_title")
+    if not isinstance(title, str):
+        return ""
+    return re.sub(r"\s+", " ", title).strip()
 
 
 def _parse_result(raw: str, source_url: str) -> ExtractionResult:
@@ -422,15 +479,44 @@ class OpenRouterClient:
         reply = await self._chat(repair_messages)
         return _parse_result(reply.content, source_url)
 
-    async def _chat(self, messages: list[dict[str, Any]]) -> ChatReply:
+    async def book_catalog_title(self, entity: Entity) -> str:
+        """English or original catalog title. Empty when already that title."""
+        notes = entity.notes.strip() or "(none)"
+        author = entity.creator_or_author.strip() or "(unknown)"
+        reply = await self._chat(
+            [
+                {"role": "system", "content": CATALOG_TITLE_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"title: {entity.name.strip()}\n"
+                        f"author: {author}\n"
+                        f"notes: {notes}"
+                    ),
+                },
+            ],
+            response_schema=CATALOG_TITLE_SCHEMA,
+            max_tokens=80,
+            temperature=0,
+        )
+        return parse_catalog_title(reply.content)
+
+    async def _chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        response_schema: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+        temperature: float = 0.2,
+    ) -> ChatReply:
         payload = {
             "model": self._settings.openrouter_model,
             "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": self._settings.max_output_tokens,
+            "temperature": temperature,
+            "max_tokens": max_tokens or self._settings.max_output_tokens,
             "response_format": {
                 "type": "json_schema",
-                "json_schema": RESULT_JSON_SCHEMA,
+                "json_schema": response_schema or RESULT_JSON_SCHEMA,
             },
             "usage": {"include": True},
         }

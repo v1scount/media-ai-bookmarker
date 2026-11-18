@@ -143,7 +143,7 @@ class Settings(BaseSettings):
         ge=1.0,
         le=60.0,
     )
-    # Optional. Empty = skip Hardcover. Set to mark extracted books Want to Read on save.
+    # Optional. Empty = skip Hardcover. Set to mark extracted books Want to Read.
     hardcover_api_key: str = Field(default="", alias="HARDCOVER_API_KEY")
     hardcover_books_per_job: int = Field(
         default=8,
@@ -157,7 +157,7 @@ class Settings(BaseSettings):
         ge=1.0,
         le=60.0,
     )
-    # Optional. Empty URL or key = skip Letterboxd. Movies only, on Save.
+    # Optional. Empty URL or key = skip Letterboxd. Movies only, after each extract.
     letterboxd_middleman_url: str = Field(
         default="",
         alias="LETTERBOXD_MIDDLEMAN_URL",

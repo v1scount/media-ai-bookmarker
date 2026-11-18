@@ -203,6 +203,7 @@ def mercadolibre_slug(query: str) -> str:
 class Entity(BaseModel):
     type: EntityType = EntityType.other
     name: str
+    alternate_names: list[str] = Field(default_factory=list)
     creator_or_author: str = ""
     notes: str = ""
     is_main_topic: bool = False
@@ -217,6 +218,22 @@ class Entity(BaseModel):
     @classmethod
     def coerce_null_strings(cls, value: object) -> object:
         return _none_to_empty(value)
+
+    @field_validator("alternate_names", mode="before")
+    @classmethod
+    def coerce_alternate_names(cls, value: object) -> object:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return [cleaned] if cleaned else []
+        if isinstance(value, list):
+            return [
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            ]
+        return []
 
     @field_validator("suggested_link", "hardcover_url", "letterboxd_url", mode="before")
     @classmethod

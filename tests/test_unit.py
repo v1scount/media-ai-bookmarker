@@ -257,6 +257,32 @@ class ExtractionSchemaTests(unittest.TestCase):
         self.assertEqual(result.entities[1].type, EntityType.other)
         self.assertIsNone(result.entities[1].suggested_link)
         self.assertEqual(result.video_kind, VideoKind.other)
+        self.assertEqual(result.entities[0].alternate_names, [])
+
+    def test_alternate_names_coerced(self) -> None:
+        omitted = Entity.model_validate({"name": "Cien años de soledad"})
+        self.assertEqual(omitted.alternate_names, [])
+
+        empty = Entity.model_validate(
+            {"name": "Cien años de soledad", "alternate_names": None}
+        )
+        self.assertEqual(empty.alternate_names, [])
+
+        cleaned = Entity.model_validate(
+            {
+                "name": "Cien años de soledad",
+                "alternate_names": [
+                    "One Hundred Years of Solitude",
+                    "",
+                    "  ",
+                    "Cien años de soledad",
+                ],
+            }
+        )
+        self.assertEqual(
+            cleaned.alternate_names,
+            ["One Hundred Years of Solitude", "Cien años de soledad"],
+        )
 
     def test_type_aliases_and_removed_track(self) -> None:
         cases = {
@@ -373,6 +399,21 @@ class TokenGuardTests(unittest.TestCase):
     def test_truncate_leaves_short_text(self) -> None:
         self.assertEqual(truncate_text("hello", 100, "transcript"), "hello")
 
+    def test_parse_catalog_title(self) -> None:
+        from app.openrouter import parse_catalog_title
+
+        self.assertEqual(
+            parse_catalog_title('{"catalog_title": "Love in the Time of Cholera"}'),
+            "Love in the Time of Cholera",
+        )
+        self.assertEqual(
+            parse_catalog_title('```json\n{"catalog_title": " Propaganda "}\n```'),
+            "Propaganda",
+        )
+        self.assertEqual(parse_catalog_title('{"catalog_title": ""}'), "")
+        self.assertEqual(parse_catalog_title("not-json"), "")
+        self.assertEqual(parse_catalog_title('{"catalog_title": 1}'), "")
+
     def test_truncate_marks_long_text(self) -> None:
         result = truncate_text("x" * 50, 10, "transcript")
         self.assertTrue(result.startswith("x" * 10))
@@ -390,6 +431,8 @@ class TokenGuardTests(unittest.TestCase):
         entity_schema = schema["properties"]["entities"]["items"]
         self.assertIn("year", entity_schema["properties"])
         self.assertIn("year", entity_schema["required"])
+        self.assertIn("alternate_names", entity_schema["properties"])
+        self.assertIn("alternate_names", entity_schema["required"])
         self.assertNotIn("letterboxd_url", entity_schema["properties"])
         self.assertNotIn("hardcover_url", entity_schema["properties"])
 
@@ -1556,6 +1599,20 @@ class HardcoverHelperTests(unittest.TestCase):
         self.assertEqual(authorization_header("Bearer abc"), "Bearer abc")
         self.assertEqual(authorization_header("bearer abc"), "bearer abc")
 
+    def test_title_needs_catalog_translation_for_local_editions(self) -> None:
+        from app.hardcover import title_needs_catalog_translation
+
+        self.assertTrue(
+            title_needs_catalog_translation(
+                "Propaganda: Cómo manipular la opinión en democracia"
+            )
+        )
+        self.assertTrue(title_needs_catalog_translation("Cien anos de soledad"))
+        self.assertFalse(title_needs_catalog_translation("Dune"))
+        self.assertFalse(
+            title_needs_catalog_translation("The Young Hitler I Knew")
+        )
+
     def test_search_query_omits_book_hint(self) -> None:
         from app.hardcover import hardcover_search_query
 
@@ -1565,6 +1622,85 @@ class HardcoverHelperTests(unittest.TestCase):
             creator_or_author="Frank Herbert",
         )
         self.assertEqual(hardcover_search_query(entity), "Dune Frank Herbert")
+
+    def test_search_queries_include_alternate_names(self) -> None:
+        from app.hardcover import hardcover_search_queries
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Cien años de soledad",
+            creator_or_author="Gabriel García Márquez",
+            alternate_names=["One Hundred Years of Solitude"],
+        )
+        self.assertEqual(
+            hardcover_search_queries(entity),
+            [
+                "Cien años de soledad Gabriel García Márquez",
+                "One Hundred Years of Solitude Gabriel García Márquez",
+            ],
+        )
+
+    def test_search_queries_collapse_duplicate_core_tokens(self) -> None:
+        from app.hardcover import hardcover_search_queries
+
+        entity = Entity(
+            type=EntityType.book,
+            name="The Dune",
+            creator_or_author="Frank Herbert",
+            alternate_names=["Dune", "Dune: The Novel", "Dune Messiah"],
+        )
+        self.assertEqual(
+            hardcover_search_queries(entity),
+            ["The Dune Frank Herbert", "Dune Messiah Frank Herbert"],
+        )
+
+    def test_search_queries_cap_at_three(self) -> None:
+        from app.hardcover import hardcover_search_queries
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Alpha",
+            creator_or_author="Author",
+            alternate_names=["Beta", "Gamma", "Delta"],
+        )
+        self.assertEqual(
+            hardcover_search_queries(entity),
+            ["Alpha Author", "Beta Author", "Gamma Author"],
+        )
+
+    def test_search_queries_split_author_dash_title(self) -> None:
+        from app.hardcover import hardcover_search_queries
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Perón - El modelo argentino",
+            creator_or_author="Juan Domingo Perón",
+        )
+        self.assertEqual(
+            hardcover_search_queries(entity),
+            [
+                "Perón - El modelo argentino Juan Domingo Perón",
+                "El modelo argentino Juan Domingo Perón",
+            ],
+        )
+
+    def test_search_queries_rewrite_comma_subtitle_to_colon(self) -> None:
+        from app.hardcover import hardcover_search_queries
+
+        entity = Entity(
+            type=EntityType.book,
+            name="La lealtad, los montoneros que se quedaron con Perón",
+            creator_or_author="Aldo Duzdevich",
+        )
+        queries = hardcover_search_queries(entity)
+        self.assertEqual(
+            queries[0],
+            "La lealtad: los montoneros que se quedaron con Perón Aldo Duzdevich",
+        )
+        self.assertNotIn(
+            "La lealtad, los montoneros que se quedaron con Perón Aldo Duzdevich",
+            queries,
+        )
 
     def test_parse_search_hits_from_dict(self) -> None:
         from app.hardcover import parse_search_hits
@@ -1588,7 +1724,75 @@ class HardcoverHelperTests(unittest.TestCase):
         self.assertEqual(hits[0].title, "Dune")
         self.assertEqual(hits[0].author_names, ["Frank Herbert"])
         self.assertEqual(hits[0].slug, "dune")
+        self.assertEqual(hits[0].alternative_titles, [])
         self.assertEqual(hits[0].url, "https://hardcover.app/books/dune")
+
+    def test_parse_search_hits_reads_alternative_titles(self) -> None:
+        from app.hardcover import parse_search_hits
+
+        hits = parse_search_hits(
+            {
+                "hits": [
+                    {
+                        "document": {
+                            "id": 12,
+                            "title": "One Hundred Years of Solitude",
+                            "author_names": ["Gabriel García Márquez"],
+                            "slug": "one-hundred-years-of-solitude",
+                            "alternative_titles": [
+                                "Cien años de soledad",
+                                "  ",
+                                "Cent ans de solitude",
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(
+            hits[0].alternative_titles,
+            ["Cien años de soledad", "Cent ans de solitude"],
+        )
+
+        string_hits = parse_search_hits(
+            {
+                "hits": [
+                    {
+                        "document": {
+                            "id": 13,
+                            "title": "Dune",
+                            "author_names": ["Frank Herbert"],
+                            "slug": "dune",
+                            "alternative_titles": "Dune: The Novel",
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(string_hits[0].alternative_titles, ["Dune: The Novel"])
+
+        object_hits = parse_search_hits(
+            {
+                "hits": [
+                    {
+                        "document": {
+                            "id": 14,
+                            "title": "Dune",
+                            "author_names": ["Frank Herbert"],
+                            "slug": "dune",
+                            "alternative_titles": [
+                                {"title": "Dune Messiah no"},
+                                {"name": "Dune: Part One"},
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(
+            object_hits[0].alternative_titles,
+            ["Dune Messiah no", "Dune: Part One"],
+        )
 
     def test_parse_search_hits_from_json_string(self) -> None:
         from app.hardcover import parse_search_hits
@@ -1679,6 +1883,152 @@ class HardcoverHelperTests(unittest.TestCase):
         self.assertIsNotNone(match)
         assert match is not None
         self.assertEqual(match.book_id, 1)
+
+    def test_pick_match_accepts_english_alternate_name(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Cien años de soledad",
+            creator_or_author="Gabriel García Márquez",
+            alternate_names=["One Hundred Years of Solitude"],
+        )
+        hits = [
+            HardcoverHit(
+                book_id=12,
+                title="One Hundred Years of Solitude",
+                author_names=["Gabriel García Márquez"],
+                slug="one-hundred-years-of-solitude",
+            )
+        ]
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, 12)
+
+    def test_pick_match_accepts_hit_alternative_title(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Cien años de soledad",
+            creator_or_author="Gabriel García Márquez",
+        )
+        hits = [
+            HardcoverHit(
+                book_id=12,
+                title="One Hundred Years of Solitude",
+                author_names=["Gabriel García Márquez"],
+                slug="one-hundred-years-of-solitude",
+                alternative_titles=["Cien años de soledad"],
+            )
+        ]
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, 12)
+
+    def test_pick_match_spanish_author_dash_title(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Perón - El modelo argentino",
+            creator_or_author="Juan Domingo Perón",
+        )
+        hits = [
+            HardcoverHit(
+                book_id=20,
+                title="El modelo argentino",
+                author_names=["Juan Domingo Perón"],
+                slug="el-modelo-argentino",
+            )
+        ]
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, 20)
+
+    def test_pick_match_spanish_articles_and_accents(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Los últimos días de Perón",
+            creator_or_author="Enrique Pavón Pereyra",
+        )
+        hits = [
+            HardcoverHit(
+                book_id=21,
+                title="Últimos dias de Peron",
+                author_names=["Enrique Pavon Pereyra"],
+                slug="ultimos-dias-de-peron",
+            )
+        ]
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, 21)
+
+        traviata = Entity(
+            type=EntityType.book,
+            name="Operación Traviata",
+            creator_or_author="Ceferino Reato",
+        )
+        traviata_hits = [
+            HardcoverHit(
+                book_id=22,
+                title="Operacion Traviata",
+                author_names=["Ceferino Reato"],
+                slug="operacion-traviata",
+            )
+        ]
+        traviata_match = pick_match(traviata, traviata_hits)
+        self.assertIsNotNone(traviata_match)
+        assert traviata_match is not None
+        self.assertEqual(traviata_match.book_id, 22)
+
+    def test_pick_match_comma_subtitle(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        entity = Entity(
+            type=EntityType.book,
+            name="La lealtad, los montoneros que se quedaron con Perón",
+            creator_or_author="Aldo Duzdevich",
+        )
+        hits = [
+            HardcoverHit(
+                book_id=23,
+                title="La lealtad",
+                author_names=["Aldo Duzdevich"],
+                slug="la-lealtad",
+            )
+        ]
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, 23)
+
+    def test_pick_match_comma_extract_vs_colon_catalog_title(self) -> None:
+        from app.hardcover import HardcoverHit, pick_match
+
+        entity = Entity(
+            type=EntityType.book,
+            name="La lealtad, los montoneros que se quedaron con Perón",
+            creator_or_author="Aldo Duzdevich",
+        )
+        hits = [
+            HardcoverHit(
+                book_id=24,
+                title="La Lealtad: Los Montoneros que se quedaron con Perón",
+                author_names=["Aldo Duzdevich"],
+                slug="la-lealtad-los-montoneros-que-se-quedaron-con-peron",
+            )
+        ]
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, 24)
 
     def test_candidates_books_only_skip_low_confidence(self) -> None:
         from app.hardcover import select_hardcover_candidates
@@ -1950,6 +2300,441 @@ class HardcoverHttpTests(unittest.IsolatedAsyncioTestCase):
             await client.aclose()
         self.assertEqual(actions[0].outcome, HardcoverOutcome.error)
 
+    async def test_retries_search_with_alternate_name(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Cien años de soledad",
+            creator_or_author="Gabriel García Márquez",
+            alternate_names=["One Hundred Years of Solitude"],
+            is_main_topic=True,
+            confidence=Confidence.high,
+        )
+        client = HardcoverClient(self._settings())
+        calls: list[str] = []
+
+        async def fake_post(*_args, **kwargs):
+            body = kwargs.get("json") or {}
+            query = body.get("query", "")
+            variables = body.get("variables") or {}
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            if "search(" in query:
+                search_query = str(variables.get("query", ""))
+                calls.append(f"search:{search_query}")
+                if "One Hundred Years of Solitude" in search_query:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "data": {
+                                "search": {
+                                    "results": {
+                                        "hits": [
+                                            {
+                                                "document": {
+                                                    "id": 12,
+                                                    "title": (
+                                                        "One Hundred Years of Solitude"
+                                                    ),
+                                                    "author_names": [
+                                                        "Gabriel García Márquez"
+                                                    ],
+                                                    "slug": (
+                                                        "one-hundred-years-of-solitude"
+                                                    ),
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        request=request,
+                    )
+                return httpx.Response(
+                    200,
+                    json={"data": {"search": {"results": {"hits": []}}}},
+                    request=request,
+                )
+            if "user_books" in query:
+                calls.append("user_books")
+                return httpx.Response(
+                    200,
+                    json={"data": {"me": {"id": 1, "user_books": []}}},
+                    request=request,
+                )
+            if "insert_user_book" in query:
+                calls.append("insert")
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "insert_user_book": {
+                                "id": 99,
+                                "user_book": {
+                                    "id": 99,
+                                    "status_id": 1,
+                                    "book_id": 12,
+                                },
+                            }
+                        }
+                    },
+                    request=request,
+                )
+            calls.append("other")
+            return httpx.Response(400, json={"error": "unexpected"}, request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([entity])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(
+            calls,
+            [
+                "search:Cien años de soledad Gabriel García Márquez",
+                "search:One Hundred Years of Solitude Gabriel García Márquez",
+                "user_books",
+                "insert",
+            ],
+        )
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
+        self.assertEqual(actions[0].entity_name, "Cien años de soledad")
+        self.assertEqual(
+            actions[0].hardcover_url,
+            "https://hardcover.app/books/one-hundred-years-of-solitude",
+        )
+
+    async def test_spanish_edition_picks_english_catalog_book(self) -> None:
+        """Bernays' Spanish edition title is absent; the leading title finds it."""
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        entity = Entity(
+            type=EntityType.book,
+            name="Propaganda: Cómo manipular la opinión en democracia",
+            creator_or_author="Edward Bernays",
+            is_main_topic=True,
+            confidence=Confidence.high,
+        )
+        called = False
+
+        async def translator(_entity: Entity) -> str:
+            nonlocal called
+            called = True
+            return "Propaganda"
+
+        client = HardcoverClient(self._settings(), title_translator=translator)
+        calls: list[str] = []
+
+        def document(book_id: int, title: str, authors: list[str], slug: str) -> dict:
+            return {
+                "document": {
+                    "id": book_id,
+                    "title": title,
+                    "author_names": authors,
+                    "slug": slug,
+                }
+            }
+
+        async def fake_post(*_args, **kwargs):
+            body = kwargs.get("json") or {}
+            query = body.get("query", "")
+            variables = body.get("variables") or {}
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            if "search(" in query:
+                search_query = str(variables.get("query", ""))
+                calls.append(f"search:{search_query}")
+                if search_query.startswith("Propaganda:"):
+                    hits = [
+                        document(
+                            1711649,
+                            "Memorias: Entre el silencio y la propaganda, la historia como fue",
+                            ["Ramón Serrano Suñer"],
+                            "memorias",
+                        )
+                    ]
+                elif search_query == "Propaganda Edward Bernays":
+                    hits = [
+                        document(
+                            2072386,
+                            "Propaganda by Edward Bernays: Annotated",
+                            ["Edward Bernays"],
+                            "propaganda-annotated",
+                        ),
+                        document(
+                            1772090,
+                            "A Summary of Propaganda by Edward Bernays",
+                            ["Notes Quark", "Edward L. Bernays"],
+                            "summary-of-propaganda",
+                        ),
+                        document(
+                            284866,
+                            "Propaganda",
+                            ["Edward L. Bernays"],
+                            "propaganda",
+                        ),
+                    ]
+                else:
+                    hits = []
+                return httpx.Response(
+                    200,
+                    json={"data": {"search": {"results": {"hits": hits}}}},
+                    request=request,
+                )
+            if "user_books" in query:
+                calls.append("user_books")
+                return httpx.Response(
+                    200,
+                    json={"data": {"me": {"id": 1, "user_books": []}}},
+                    request=request,
+                )
+            if "insert_user_book" in query:
+                calls.append("insert")
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "insert_user_book": {
+                                "id": 99,
+                                "user_book": {
+                                    "id": 99,
+                                    "status_id": 1,
+                                    "book_id": 284866,
+                                },
+                            }
+                        }
+                    },
+                    request=request,
+                )
+            calls.append("other")
+            return httpx.Response(400, json={"error": "unexpected"}, request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([entity])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(
+            calls,
+            [
+                "search:Propaganda: Cómo manipular la opinión en democracia Edward Bernays",
+                "search:Propaganda Edward Bernays",
+                "user_books",
+                "insert",
+            ],
+        )
+        self.assertFalse(called)
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
+        self.assertEqual(
+            actions[0].hardcover_url, "https://hardcover.app/books/propaganda"
+        )
+
+    async def test_catalog_title_search_when_translation_shares_no_tokens(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        entity = Entity(
+            type=EntityType.book,
+            name="El amor en los tiempos del cólera",
+            creator_or_author="Gabriel García Márquez",
+            is_main_topic=True,
+            confidence=Confidence.high,
+        )
+
+        async def translator(_entity: Entity) -> str:
+            return "Love in the Time of Cholera"
+
+        client = HardcoverClient(self._settings(), title_translator=translator)
+        calls: list[str] = []
+
+        async def fake_post(*_args, **kwargs):
+            body = kwargs.get("json") or {}
+            query = body.get("query", "")
+            variables = body.get("variables") or {}
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            if "search(" in query:
+                search_query = str(variables.get("query", ""))
+                calls.append(f"search:{search_query}")
+                if "Love in the Time of Cholera" in search_query:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "data": {
+                                "search": {
+                                    "results": {
+                                        "hits": [
+                                            {
+                                                "document": {
+                                                    "id": 88,
+                                                    "title": "Love in the Time of Cholera",
+                                                    "author_names": [
+                                                        "Gabriel García Márquez"
+                                                    ],
+                                                    "slug": "love-in-the-time-of-cholera",
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        request=request,
+                    )
+                return httpx.Response(
+                    200,
+                    json={"data": {"search": {"results": {"hits": []}}}},
+                    request=request,
+                )
+            if "user_books" in query:
+                calls.append("user_books")
+                return httpx.Response(
+                    200,
+                    json={"data": {"me": {"id": 1, "user_books": []}}},
+                    request=request,
+                )
+            if "insert_user_book" in query:
+                calls.append("insert")
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "insert_user_book": {
+                                "id": 99,
+                                "user_book": {
+                                    "id": 99,
+                                    "status_id": 1,
+                                    "book_id": 88,
+                                },
+                            }
+                        }
+                    },
+                    request=request,
+                )
+            calls.append("other")
+            return httpx.Response(400, json={"error": "unexpected"}, request=request)
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([entity])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(
+            calls,
+            [
+                "search:El amor en los tiempos del cólera Gabriel García Márquez",
+                "search:Love in the Time of Cholera Gabriel García Márquez",
+                "user_books",
+                "insert",
+            ],
+        )
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
+        self.assertEqual(actions[0].entity_name, "El amor en los tiempos del cólera")
+        self.assertEqual(
+            actions[0].hardcover_url,
+            "https://hardcover.app/books/love-in-the-time-of-cholera",
+        )
+
+    async def test_english_miss_does_not_translate(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        called = False
+
+        async def translator(_entity: Entity) -> str:
+            nonlocal called
+            called = True
+            return "Dune"
+
+        client = HardcoverClient(self._settings(), title_translator=translator)
+
+        async def fake_post(*_args, **kwargs):
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            return httpx.Response(
+                200,
+                json={"data": {"search": {"results": {"hits": []}}}},
+                request=request,
+            )
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([self._dune()])
+        finally:
+            await client.aclose()
+
+        self.assertFalse(called)
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.no_match)
+
+    async def test_catalog_title_failure_stays_no_match(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        entity = Entity(
+            type=EntityType.book,
+            name="El amor en los tiempos del cólera",
+            creator_or_author="Gabriel García Márquez",
+            is_main_topic=True,
+            confidence=Confidence.high,
+        )
+
+        async def translator(_entity: Entity) -> str:
+            raise RuntimeError("openrouter down")
+
+        client = HardcoverClient(self._settings(), title_translator=translator)
+        calls: list[str] = []
+
+        async def fake_post(*_args, **kwargs):
+            calls.append("search")
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            return httpx.Response(
+                200,
+                json={"data": {"search": {"results": {"hits": []}}}},
+                request=request,
+            )
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([entity])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(calls, ["search"])
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.no_match)
+
+    async def test_blank_catalog_title_does_not_search_again(self) -> None:
+        from app.hardcover import HardcoverClient, HardcoverOutcome
+
+        entity = Entity(
+            type=EntityType.book,
+            name="El amor en los tiempos del cólera",
+            creator_or_author="Gabriel García Márquez",
+            is_main_topic=True,
+            confidence=Confidence.high,
+        )
+
+        async def translator(_entity: Entity) -> str:
+            return "  "
+
+        client = HardcoverClient(self._settings(), title_translator=translator)
+        calls: list[str] = []
+
+        async def fake_post(*_args, **kwargs):
+            calls.append("search")
+            request = httpx.Request("POST", "https://api.hardcover.app/v1/graphql")
+            return httpx.Response(
+                200,
+                json={"data": {"search": {"results": {"hits": []}}}},
+                request=request,
+            )
+
+        client._client.post = fake_post  # type: ignore[method-assign]
+        try:
+            actions = await client.sync_books([entity])
+        finally:
+            await client.aclose()
+
+        self.assertEqual(calls, ["search"])
+        self.assertEqual(actions[0].outcome, HardcoverOutcome.no_match)
+
 
 class HardcoverSaveTests(unittest.IsolatedAsyncioTestCase):
     def _result(self) -> ExtractionResult:
@@ -1970,10 +2755,10 @@ class HardcoverSaveTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_save_without_key_skips_sync(self) -> None:
+    async def test_sync_without_key_skips_and_writes_no_note(self) -> None:
         from unittest.mock import AsyncMock
 
-        from app.hardcover import HardcoverClient, sync_hardcover_then_save
+        from app.hardcover import HardcoverClient, sync_catalogs
 
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
@@ -1989,24 +2774,25 @@ class HardcoverSaveTests(unittest.IsolatedAsyncioTestCase):
             client.sync_books = AsyncMock()  # type: ignore[method-assign]
             result = self._result()
             try:
-                path, actions = await sync_hardcover_then_save(
+                hardcover_actions, letterboxd_actions = await sync_catalogs(
                     settings, client, result
                 )
             finally:
                 await client.aclose()
             client.sync_books.assert_not_awaited()
-            self.assertEqual(actions, [])
-            self.assertTrue(path.exists())
+            self.assertEqual(hardcover_actions, [])
+            self.assertEqual(letterboxd_actions, [])
+            self.assertFalse((Path(tmp) / "Extracts").exists())
             self.assertIsNone(result.entities[0].hardcover_url)
 
-    async def test_save_with_key_syncs_before_vault_write(self) -> None:
+    async def test_sync_stamps_url_and_note_stays_optional(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
 
         from app.hardcover import (
             HardcoverAction,
             HardcoverClient,
             HardcoverOutcome,
-            sync_hardcover_then_save,
+            sync_catalogs,
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2032,13 +2818,18 @@ class HardcoverSaveTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             result = self._result()
-            path, actions = await sync_hardcover_then_save(settings, client, result)
+            hardcover_actions, letterboxd_actions = await sync_catalogs(
+                settings, client, result
+            )
             client.sync_books.assert_awaited_once()
-            self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
+            self.assertEqual(hardcover_actions[0].outcome, HardcoverOutcome.added)
+            self.assertEqual(letterboxd_actions, [])
             self.assertEqual(
                 result.entities[0].hardcover_url,
                 "https://hardcover.app/books/dune",
             )
+            self.assertFalse((Path(tmp) / "Extracts").exists())
+            path = save_to_obsidian(settings, result)
             note = path.read_text(encoding="utf-8")
             self.assertIn("[hardcover](https://hardcover.app/books/dune)", note)
 
@@ -2334,7 +3125,7 @@ class LetterboxdHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actions[0].letterboxd_url, "")
 
 
-class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
+class SyncCatalogsTests(unittest.IsolatedAsyncioTestCase):
     def _vault(self, tmp: str, **overrides: object) -> Settings:
         values: dict[str, object] = {
             "TELEGRAM_BOT_TOKEN": "x",
@@ -2386,7 +3177,7 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
     async def test_books_only_never_posts_to_letterboxd(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
 
-        from app.hardcover import HardcoverClient, sync_then_save
+        from app.hardcover import HardcoverClient, sync_catalogs
         from app.letterboxd import LetterboxdClient
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2397,19 +3188,19 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
             letterboxd = MagicMock(spec=LetterboxdClient)
             letterboxd.enabled = True
             letterboxd.sync_movies = AsyncMock(return_value=[])
-            path, hc_actions, lb_actions = await sync_then_save(
+            hc_actions, lb_actions = await sync_catalogs(
                 settings, hardcover, self._book_result(), letterboxd
             )
             hardcover.sync_books.assert_awaited_once()
             letterboxd.sync_movies.assert_not_awaited()
             self.assertEqual(hc_actions, [])
             self.assertEqual(lb_actions, [])
-            self.assertTrue(path.exists())
+            self.assertFalse((Path(tmp) / "Extracts").exists())
 
     async def test_movies_only_never_calls_hardcover(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
 
-        from app.hardcover import HardcoverClient, sync_then_save
+        from app.hardcover import HardcoverClient, sync_catalogs
         from app.letterboxd import (
             LetterboxdAction,
             LetterboxdClient,
@@ -2437,7 +3228,7 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             result = self._movie_result()
-            path, hc_actions, lb_actions = await sync_then_save(
+            hc_actions, lb_actions = await sync_catalogs(
                 settings, hardcover, result, letterboxd
             )
             hardcover.sync_books.assert_not_awaited()
@@ -2448,7 +3239,8 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
                 result.entities[0].letterboxd_url,
                 "https://letterboxd.com/film/inception/",
             )
-            note = path.read_text(encoding="utf-8")
+            self.assertFalse((Path(tmp) / "Extracts").exists())
+            note = save_to_obsidian(settings, result).read_text(encoding="utf-8")
             self.assertIn("[letterboxd](https://letterboxd.com/film/inception/)", note)
 
     async def test_mixed_calls_both(self) -> None:
@@ -2458,7 +3250,7 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
             HardcoverAction,
             HardcoverClient,
             HardcoverOutcome,
-            sync_then_save,
+            sync_catalogs,
         )
         from app.letterboxd import (
             LetterboxdAction,
@@ -2509,7 +3301,7 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ],
             )
-            await sync_then_save(settings, hardcover, result, letterboxd)
+            await sync_catalogs(settings, hardcover, result, letterboxd)
             hardcover.sync_books.assert_awaited_once()
             letterboxd.sync_movies.assert_awaited_once()
             self.assertEqual(
@@ -2527,7 +3319,7 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
             HardcoverAction,
             HardcoverClient,
             HardcoverOutcome,
-            sync_then_save,
+            sync_catalogs,
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2544,19 +3336,17 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             result = self._book_result(SourceKind.x)
-            path, actions, lb_actions = await sync_then_save(
-                settings, hardcover, result
-            )
+            actions, lb_actions = await sync_catalogs(settings, hardcover, result)
             hardcover.sync_books.assert_awaited_once()
             self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
             self.assertEqual(lb_actions, [])
             self.assertEqual(result.source_kind, SourceKind.x)
-            self.assertTrue(path.exists())
+            self.assertFalse((Path(tmp) / "Extracts").exists())
 
-    async def test_letterboxd_error_still_writes_note(self) -> None:
+    async def test_letterboxd_error_does_not_block_optional_note(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
 
-        from app.hardcover import HardcoverClient, sync_then_save
+        from app.hardcover import HardcoverClient, sync_catalogs
         from app.letterboxd import (
             LetterboxdAction,
             LetterboxdClient,
@@ -2578,11 +3368,13 @@ class SyncThenSaveTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             result = self._movie_result()
-            path, _hc, lb_actions = await sync_then_save(
+            _hc, lb_actions = await sync_catalogs(
                 settings, hardcover, result, letterboxd
             )
             self.assertEqual(lb_actions[0].outcome, LetterboxdOutcome.error)
             self.assertIsNone(result.entities[0].letterboxd_url)
+            self.assertFalse((Path(tmp) / "Extracts").exists())
+            path = save_to_obsidian(settings, result)
             self.assertTrue(path.exists())
 
 
@@ -2607,6 +3399,90 @@ class LetterboxdObsidianTests(unittest.TestCase):
         self.assertIn("[letterboxd](https://letterboxd.com/film/inception/)", md)
         preview = format_preview(result)
         self.assertIn("letterboxd", preview)
+
+
+class CatalogProgressTests(unittest.TestCase):
+    def test_progress_follows_the_media_that_will_be_written(self) -> None:
+        from unittest.mock import MagicMock
+
+        from app.bot import _catalog_progress, _catalog_report
+        from app.hardcover import HardcoverAction, HardcoverClient, HardcoverOutcome
+        from app.letterboxd import LetterboxdAction, LetterboxdClient, LetterboxdOutcome
+
+        settings = Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+            HARDCOVER_API_KEY="secret",
+            LETTERBOXD_MIDDLEMAN_URL="http://127.0.0.1:8787",
+            LETTERBOXD_MIDDLEMAN_API_KEY="secret",
+        )
+        hardcover = MagicMock(spec=HardcoverClient)
+        hardcover.enabled = True
+        letterboxd = MagicMock(spec=LetterboxdClient)
+        letterboxd.enabled = True
+        book = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Book",
+            summary="A novel.",
+            entities=[
+                Entity(type=EntityType.book, name="Dune", confidence=Confidence.high)
+            ],
+        )
+        movie = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/2",
+            title="Film",
+            summary="A movie.",
+            entities=[
+                Entity(
+                    type=EntityType.movie, name="Inception", confidence=Confidence.high
+                )
+            ],
+        )
+        both = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/3",
+            title="Mix",
+            summary="Both.",
+            entities=[*book.entities, *movie.entities],
+        )
+        tool = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/4",
+            title="Tool",
+            summary="An app.",
+            entities=[
+                Entity(type=EntityType.tool, name="Obsidian", confidence=Confidence.high)
+            ],
+        )
+        self.assertEqual(
+            _catalog_progress(settings, hardcover, letterboxd, book),
+            "Adding books to Hardcover…",
+        )
+        self.assertEqual(
+            _catalog_progress(settings, hardcover, letterboxd, movie),
+            "Adding movies to Letterboxd…",
+        )
+        self.assertEqual(
+            _catalog_progress(settings, hardcover, letterboxd, both),
+            "Adding books to Hardcover and movies to Letterboxd…",
+        )
+        self.assertIsNone(_catalog_progress(settings, hardcover, letterboxd, tool))
+        self.assertEqual(
+            _catalog_report(
+                [
+                    HardcoverAction(
+                        entity_name="Dune",
+                        outcome=HardcoverOutcome.added,
+                    )
+                ],
+                [
+                    LetterboxdAction(
+                        entity_name="Inception",
+                        outcome=LetterboxdOutcome.added,
+                    )
+                ],
+            ),
+            "Hardcover: added Dune as Want to Read\n\n"
+            "Letterboxd: added Inception to watchlist",
+        )
 
 
 if __name__ == "__main__":

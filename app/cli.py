@@ -1,5 +1,8 @@
 """CLI harness to test the extraction pipeline without Telegram.
 
+Books go to Hardcover and movies to Letterboxd when those are configured.
+`--save` also writes the Obsidian note.
+
 Usage:
   python -m app.cli "https://www.tiktok.com/@user/video/123"
   python -m app.cli "https://vm.tiktok.com/xxx" --save
@@ -18,12 +21,12 @@ from app.config import get_settings
 from app.hardcover import (
     HardcoverClient,
     format_hardcover_report,
-    sync_then_save,
+    sync_catalogs,
 )
 from app.kagi import KagiClient
 from app.letterboxd import LetterboxdClient, format_letterboxd_report
 from app.models import extract_supported_url
-from app.obsidian import relative_vault_path
+from app.obsidian import relative_vault_path, save_to_obsidian
 from app.openrouter import OpenRouterClient
 from app.pipeline import Pipeline, format_preview
 
@@ -37,7 +40,9 @@ async def _run(url: str, save: bool) -> int:
     settings = get_settings()
     openrouter = OpenRouterClient(settings)
     kagi = KagiClient(settings)
-    hardcover = HardcoverClient(settings)
+    hardcover = HardcoverClient(
+        settings, title_translator=openrouter.book_catalog_title
+    )
     letterboxd = LetterboxdClient(settings)
     pipeline = Pipeline(settings, openrouter, kagi)
     try:
@@ -52,17 +57,18 @@ async def _run(url: str, save: bool) -> int:
         # Strip HTML tags roughly for console
         preview = format_preview(result, amazon_host=settings.amazon_search_host)
         print(preview.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<code>", "`").replace("</code>", "`"))
+        hardcover_actions, letterboxd_actions = await sync_catalogs(
+            settings, hardcover, result, letterboxd
+        )
+        for report in (
+            format_hardcover_report(hardcover_actions),
+            format_letterboxd_report(letterboxd_actions),
+        ):
+            if report:
+                print(report)
         if save:
-            path, hardcover_actions, letterboxd_actions = await sync_then_save(
-                settings, hardcover, result, letterboxd
-            )
+            path = await asyncio.to_thread(save_to_obsidian, settings, result)
             print(f"\nSaved: {relative_vault_path(settings, path)}")
-            for report in (
-                format_hardcover_report(hardcover_actions),
-                format_letterboxd_report(letterboxd_actions),
-            ):
-                if report:
-                    print(report)
         return 0
     finally:
         await openrouter.aclose()
@@ -73,13 +79,16 @@ async def _run(url: str, save: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run the TikTok / X extraction pipeline"
+        description=(
+            "Run the TikTok / X extraction pipeline. "
+            "Books and movies are sent to Hardcover and Letterboxd when configured."
+        )
     )
     parser.add_argument("url", help="TikTok or X post URL")
     parser.add_argument(
         "--save",
         action="store_true",
-        help="Write Markdown into the Obsidian vault folder",
+        help="Also write a Markdown note into the Obsidian vault",
     )
     args = parser.parse_args(argv)
 

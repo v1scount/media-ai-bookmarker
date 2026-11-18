@@ -1,6 +1,6 @@
 # TikTok / X → Telegram → Obsidian Extractor
 
-Self-hosted bot: send a TikTok or X (Twitter) link on Telegram → local extraction → OpenRouter multimodal extraction → optional save as Markdown into your Obsidian vault.
+Self-hosted bot: send a TikTok or X (Twitter) link on Telegram → local extraction → OpenRouter multimodal extraction → books to Hardcover and movies to Letterboxd. Saving a Markdown note into your Obsidian vault is optional.
 
 - **TikTok:** `yt-dlp` download → `faster-whisper` transcript + sampled frames → model extraction.
 - **X:** same model extraction by default (post text, linked pages, photos, and video when present). Set `X_USE_LLM=false` to save the post verbatim with no model call.
@@ -39,10 +39,10 @@ cp .env.example .env
 | `KAGI_API_KEY` | Optional. From [kagi.com/api/keys](https://kagi.com/api/keys). Empty = search links only |
 | `KAGI_SEARCH_PER_JOB` | Max Kagi API searches per video (default `3`; `0` disables the API) |
 | `HARDCOVER_API_KEY` | Optional. From [Hardcover API settings](https://docs.hardcover.app/api/getting-started/). Empty = skip Hardcover |
-| `HARDCOVER_BOOKS_PER_JOB` | Max books to look up per save (default `8`; `0` disables) |
+| `HARDCOVER_BOOKS_PER_JOB` | Max books to look up per post (default `8`; `0` disables) |
 | `LETTERBOXD_MIDDLEMAN_URL` | Optional. letterboxd-middleman base URL. Empty = skip Letterboxd. From Docker: `http://letterboxd-middleman:8787` (shared `media-ai` network) |
 | `LETTERBOXD_MIDDLEMAN_API_KEY` | Optional. Same secret as the middleman's `MIDDLEMAN_API_KEY` |
-| `LETTERBOXD_MOVIES_PER_JOB` | Max movies to look up per save (default `4`; `0` disables) |
+| `LETTERBOXD_MOVIES_PER_JOB` | Max movies to look up per post (default `4`; `0` disables) |
 | `AMAZON_SEARCH_HOST` | Host for product Amazon search links (default `www.amazon.com`) |
 
 3. Discover your Telegram user id: message the bot with `/whoami` (no allowlist needed), or use [@userinfobot](https://t.me/userinfobot). Put that number in `ALLOWED_TELEGRAM_USER_IDS`.
@@ -91,8 +91,9 @@ own text, a `## Links` section, and a `## Media` section, and they are free.
 Photos, videos, and GIFs are all downloaded into `OBSIDIAN_ATTACHMENTS_DIR` (by
 default an `attachments` folder beside your notes) and embedded as `![[...]]`
 wikilinks, which Obsidian renders as an inline player for video. X serves animated
-GIFs as `.mp4`, so they are saved that way too. The download happens when you tap
-**Save**, never on preview, so a dismissed post leaves nothing behind.
+GIFs as `.mp4`, so they are saved that way too. Vault files are copied only when
+you tap **Save to Obsidian**, so dismissing the note leaves the vault untouched.
+Hardcover and Letterboxd are updated before that choice.
 
 Files above `MAX_ATTACHMENT_MB` (100 by default) are skipped and the note falls back
 to a plain link, so one huge video cannot fill your vault.
@@ -112,8 +113,8 @@ x.com cookies if you hit that. Text, links, and photos never need cookies.
 ## Usage
 
 1. Share a TikTok URL (`tiktok.com` / `vm.tiktok.com` / `vt.tiktok.com`) or an X post URL to the bot.
-2. Wait for the preview (summary + entities).
-3. Tap **Save to Obsidian** or **Dismiss**.
+2. Wait while it extracts the post. Books are added to Hardcover and movies to Letterboxd when those are configured. The reply says what was added.
+3. Tap **Save to Obsidian** to keep a Markdown note, or **Dismiss** to skip it. Dismiss does not undo the catalog update.
 
 Both sources write into the same vault folder. Notes are tagged `[tiktok, extract]`
 or `[x, extract]` and carry a `source_kind` frontmatter field, so they stay easy to
@@ -125,11 +126,13 @@ Optional. Create an API token in Hardcover account settings and set `HARDCOVER_A
 New scoped tokens (August 2026+) need catalog search, own-library read, and
 `insert_user_book` write.
 
-On **Save** only, extracted `book` items (not low-confidence) from **either** TikTok
-or X are searched by title and author. A confident match that is not already on your
-shelf is added as Want to Read. Any existing status is left alone. Dismiss and failed
-matches do not write to Hardcover. Matched books get a `[hardcover](...)` link in the
-note.
+After extraction, `book` items (not low-confidence) from **either** TikTok or X
+are searched by title and author. When those queries miss and the title looks
+translated, the bot asks for the English or original catalog title and searches that
+with the author. A confident match that is not already on your shelf is added as
+Want to Read. Any existing status is left alone. Failed matches do not write to
+Hardcover. This happens whether or not you save the note. If you do, matched books
+get a `[hardcover](...)` link.
 
 ## Letterboxd
 
@@ -143,22 +146,23 @@ container itself) and do not use `host.docker.internal` either: the middleman pu
 port 8787 on the host loopback only, so the Docker gateway cannot reach it. Recreate
 **both** stacks after this change so they join the same network.
 
-On **Save** only, extracted `movie` items (not low-confidence, not TV `series`) from
-TikTok or X are posted to `POST /watchlist` as `{title, year?, director?}`. Year comes
+After extraction, `movie` items (not low-confidence, not TV `series`) from TikTok
+or X are posted to `POST /watchlist` as `{title, year?, director?}`. Year comes
 from the model when it knows it, otherwise from a trailing `(2010)` on the title or
 notes. Director is `creator_or_author`. A film already on the watchlist is left as-is.
-Dismiss, no match, and ambiguous results do not write. Matched films get a
-`[letterboxd](...)` link in the note.
+No match and ambiguous results do not write. This happens whether or not you save
+the note. If you do, matched films get a `[letterboxd](...)` link.
 
-Appium can take tens of seconds per film, so the bot warns before a movie save and
-caps lookups at `LETTERBOXD_MOVIES_PER_JOB` (default 4).
+Appium can take tens of seconds per film, so the bot says it is adding movies
+before the preview, and caps lookups at `LETTERBOXD_MOVIES_PER_JOB` (default 4).
 
-A save with only books never talks to Letterboxd. A save with only movies never talks
-to Hardcover. A mixed extract dispatches each item to its own service.
+A post with only books never talks to Letterboxd. A post with only movies never
+talks to Hardcover. A mixed extract dispatches each item to its own service.
 
 ## Local CLI (optional)
 
-For debugging without Telegram, run inside the container:
+For debugging without Telegram, run inside the container. A run updates Hardcover
+and Letterboxd when those are configured. `--save` also writes the note:
 
 ```bash
 docker compose exec bot python -m app.cli "https://www.tiktok.com/@user/video/123"
@@ -202,17 +206,18 @@ Notes on behaviour:
   directly. API failures fall back to the Kagi search link. This is billed separately
   ([~$12 / 1k searches](https://kagi.com/api/pricing); a $5 monthly credit is ~416 calls).
   `docker compose logs bot | grep kagi` shows each lookup.
-- If `HARDCOVER_API_KEY` is set, **Save** (or CLI `--save`) looks up extracted **books**
+- If `HARDCOVER_API_KEY` is set, each processed post looks up extracted **books**
   on [Hardcover](https://hardcover.app) from TikTok or X and marks confident matches
   **Want to Read**. Books already on your shelf (any status) are left unchanged.
-  Dismiss never writes to Hardcover. Unmatched or failed lookups still save the
-  Obsidian note. New scoped tokens need catalog search, own-library read, and
-  `insert_user_book` write. `docker compose logs bot | grep hardcover` shows each lookup.
-- If `LETTERBOXD_MIDDLEMAN_URL` and `LETTERBOXD_MIDDLEMAN_API_KEY` are set, **Save**
-  posts extracted **movies** to letterboxd-middleman (`POST /watchlist`) and adds
-  confident matches to your Letterboxd watchlist. Films already on the list are left
-  unchanged. Dismiss never writes. `docker compose logs bot | grep letterboxd` shows
-  each lookup.
+  Skipping the Obsidian note does not undo that. Unmatched or failed lookups still
+  leave the optional note available. New scoped tokens need catalog search,
+  own-library read, and `insert_user_book` write.
+  `docker compose logs bot | grep hardcover` shows each lookup.
+- If `LETTERBOXD_MIDDLEMAN_URL` and `LETTERBOXD_MIDDLEMAN_API_KEY` are set, each
+  processed post sends extracted **movies** to letterboxd-middleman
+  (`POST /watchlist`) and adds confident matches to your Letterboxd watchlist.
+  Films already on the list are left unchanged. Skipping the note does not undo
+  that. `docker compose logs bot | grep letterboxd` shows each lookup.
 - Items marked low confidence render as `_(uncertain)_`.
 - List videos render every item under `## Items`; single-topic videos lead with
   `## Recommendation` and push passing mentions to `## Also mentioned`. Each item
@@ -233,9 +238,10 @@ Notes on behaviour:
 6. OpenRouter multimodal → structured JSON (tools / books / movies / music)
 7. Optional: Kagi Search API fills a few missing item URLs (skipped without `KAGI_API_KEY`)
 8. Always delete temp job directory
-9. Telegram preview + save keyboard; photos are fetched into the vault on save
-10. On Save only: books → Hardcover Want to Read; movies → Letterboxd watchlist
-    (a type that is absent is skipped)
+9. Books → Hardcover Want to Read; movies → Letterboxd watchlist
+   (a type that is absent is skipped). Independent of the note
+10. Telegram preview plus an optional save keyboard. Photos are copied into the
+    vault only if you save the note
 
 ## Token cost controls
 
@@ -276,8 +282,8 @@ app/
   frames.py       Near-duplicate frame dropping (saves image tokens)
   openrouter.py   Multimodal extraction client
   kagi.py         Optional Kagi Search API client (direct page URLs)
-  hardcover.py    Optional Hardcover client (Want to Read on save)
-  letterboxd.py   Optional letterboxd-middleman client (watchlist on save)
+  hardcover.py    Optional Hardcover client (Want to Read after extract)
+  letterboxd.py   Optional letterboxd-middleman client (watchlist after extract)
   obsidian.py     Markdown renderer + atomic vault write
   config.py       Settings from env
   models.py       Schema + URL parsing

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass
+import unicodedata
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -19,7 +19,6 @@ from app.letterboxd import (
     select_letterboxd_candidates,
 )
 from app.models import Confidence, Entity, EntityType, ExtractionResult
-from app.obsidian import save_to_obsidian
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +36,72 @@ STATUS_LABELS: dict[int, str] = {
     6: "Ignored",
 }
 
-_TITLE_STOP_WORDS = frozenset({"a", "an", "the", "book", "novel"})
+_TITLE_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "book",
+        "novel",
+        "el",
+        "la",
+        "los",
+        "las",
+        "lo",
+        "un",
+        "una",
+        "unos",
+        "unas",
+        "del",
+        "al",
+    }
+)
+# Function words that show a title is not already an English catalog title.
+# Checked on a miss only, before spending a translation call.
+_FOREIGN_TITLE_TOKENS = frozenset(
+    {
+        "el",
+        "los",
+        "las",
+        "del",
+        "al",
+        "un",
+        "una",
+        "unos",
+        "unas",
+        "lo",
+        "como",
+        "para",
+        "por",
+        "con",
+        "de",
+        "en",
+        "y",
+        "les",
+        "des",
+        "une",
+        "du",
+        "dans",
+        "und",
+        "der",
+        "die",
+        "das",
+        "den",
+        "ein",
+        "eine",
+        "gli",
+        "dei",
+        "delle",
+        "nel",
+        "nella",
+        "van",
+        "het",
+        "een",
+    }
+)
 _LOOKUP_FAILED = object()
+MAX_TITLE_CANDIDATES = 3
+_SUBTITLE_SPLIT_RE = re.compile(r"[:\u2014\u2013]|[ \t]+-[ \t]+|,\s+")
 
 SEARCH_QUERY = """
 query SearchBooks($query: String!) {
@@ -88,6 +151,7 @@ class HardcoverHit:
     title: str
     author_names: list[str]
     slug: str
+    alternative_titles: list[str] = field(default_factory=list)
 
     @property
     def url(self) -> str:
@@ -123,11 +187,49 @@ def authorization_header(api_key: str) -> str:
     return f"Bearer {key}"
 
 
+def _title_author_query(title: str, author: str) -> str:
+    return " ".join(part for part in (title, author) if part).strip()
+
+
+def _has_subtitle(title: str) -> bool:
+    return bool(_SUBTITLE_SPLIT_RE.search(title or ""))
+
+
+def _comma_to_colon_title(title: str) -> str:
+    """Hardcover titles use a colon; extracts often use a comma instead."""
+    return re.sub(r",\s+", ": ", (title or "").strip(), count=1)
+
+
+def _raw_title_tokens(title: str) -> set[str]:
+    text = _fold_accents(_strip_parentheticals(title or "").lower())
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return {token for token in text.split() if token}
+
+
+def title_needs_catalog_translation(title: str) -> bool:
+    """True when a missed title still looks like a translation or local edition."""
+    if any(ch.isalpha() and ord(ch) > 127 for ch in title or ""):
+        return True
+    return bool(_raw_title_tokens(title) & _FOREIGN_TITLE_TOKENS)
+
+
 def hardcover_search_query(entity: Entity) -> str:
-    """Title plus author only — no generic 'book' search hint."""
-    return " ".join(
-        part for part in (entity.name, entity.creator_or_author) if part
-    ).strip()
+    """First title plus author only — no generic 'book' search hint."""
+    queries = hardcover_search_queries(entity)
+    return queries[0] if queries else ""
+
+
+def hardcover_search_queries(entity: Entity) -> list[str]:
+    """One title+author query per distinct extracted title, name first."""
+    author = entity.creator_or_author
+    queries: list[str] = []
+    seen: set[str] = set()
+    for title in entity_title_candidates(entity):
+        query = _title_author_query(_comma_to_colon_title(title), author)
+        if query and query not in seen:
+            seen.add(query)
+            queries.append(query)
+    return queries
 
 
 def _as_int(value: object) -> Optional[int]:
@@ -146,10 +248,18 @@ def _strip_parentheticals(text: str) -> str:
     return re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", text)
 
 
-def _core_title_tokens(title: str) -> list[str]:
+def _fold_accents(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def _core_title_tokens(title: str, *, leading_only: bool = False) -> list[str]:
     text = _strip_parentheticals(title or "")
-    text = re.split(r"[:\u2014\u2013]", text, maxsplit=1)[0]
-    text = text.lower()
+    if leading_only:
+        text = _SUBTITLE_SPLIT_RE.split(text, maxsplit=1)[0]
+    else:
+        text = _SUBTITLE_SPLIT_RE.sub(" ", text)
+    text = _fold_accents(text.lower())
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     return [
         token
@@ -158,14 +268,97 @@ def _core_title_tokens(title: str) -> list[str]:
     ]
 
 
-def titles_match(extracted: str, hit_title: str) -> bool:
+def titles_match(extracted: str, hit_title: str, author: str = "") -> bool:
     left = _core_title_tokens(extracted)
     right = _core_title_tokens(hit_title)
+    if bool(left) and left == right:
+        return True
+    if _has_subtitle(extracted) or _has_subtitle(hit_title):
+        lead_left = _core_title_tokens(extracted, leading_only=True)
+        lead_right = _core_title_tokens(hit_title, leading_only=True)
+        if bool(lead_left) and lead_left == lead_right:
+            return True
+    author_tokens = _name_tokens(author)
+    if not author_tokens:
+        return False
+    left = [token for token in left if token not in author_tokens]
+    right = [token for token in right if token not in author_tokens]
     return bool(left) and left == right
 
 
+def _title_dedupe_key(title: str) -> tuple[str, ...]:
+    tokens = tuple(_core_title_tokens(title))
+    if tokens:
+        return tokens
+    return (_fold_accents(title.lower().strip()),)
+
+
+def _title_segments(title: str) -> list[str]:
+    cleaned = (title or "").strip()
+    if not cleaned:
+        return []
+    segments = [cleaned]
+    for part in _SUBTITLE_SPLIT_RE.split(cleaned):
+        part = part.strip()
+        if part and part not in segments:
+            segments.append(part)
+    return segments
+
+
+def _segment_is_author_only(segment: str, author: str) -> bool:
+    tokens = set(_core_title_tokens(segment))
+    if not tokens:
+        return True
+    return not (tokens - _name_tokens(author))
+
+
+def entity_title_candidates(entity: Entity) -> list[str]:
+    """Unique extracted titles, name first, capped so search cannot fan out."""
+    seen: set[tuple[str, ...]] = set()
+    candidates: list[str] = []
+    segments: list[str] = []
+    for title in (entity.name, *entity.alternate_names):
+        for segment in _title_segments(title):
+            if segment not in segments:
+                segments.append(segment)
+    for index, cleaned in enumerate(segments):
+        if index > 0 and _segment_is_author_only(cleaned, entity.creator_or_author):
+            continue
+        key = _title_dedupe_key(cleaned)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(cleaned)
+        if len(candidates) >= MAX_TITLE_CANDIDATES:
+            break
+    return candidates
+
+
+def _string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return [cleaned] if cleaned else []
+    if not isinstance(value, list):
+        return []
+    titles: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            cleaned = item.strip()
+            if cleaned:
+                titles.append(cleaned)
+        elif isinstance(item, dict):
+            text = str(item.get("title") or item.get("name") or "").strip()
+            if text:
+                titles.append(text)
+    return titles
+
+
+def _hit_titles(hit: HardcoverHit) -> list[str]:
+    return [title for title in (hit.title, *hit.alternative_titles) if title.strip()]
+
+
 def _name_tokens(name: str) -> set[str]:
-    text = (name or "").lower()
+    text = _fold_accents((name or "").lower())
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     return {token for token in text.split() if len(token) > 1}
 
@@ -229,13 +422,25 @@ def _hit_from_item(item: object) -> Optional[HardcoverHit]:
         title=title,
         author_names=author_names,
         slug=slug,
+        alternative_titles=_string_list(document.get("alternative_titles")),
     )
 
 
-def pick_match(entity: Entity, hits: list[HardcoverHit]) -> Optional[HardcoverHit]:
+def pick_match(
+    entity: Entity,
+    hits: list[HardcoverHit],
+    extra_titles: list[str] | None = None,
+) -> Optional[HardcoverHit]:
     """First hit whose title is close and whose authors overlap when known."""
+    extracted = entity_title_candidates(entity)
+    if extra_titles:
+        extracted = [*extracted, *extra_titles]
     for hit in hits:
-        if not titles_match(entity.name, hit.title):
+        if not any(
+            titles_match(candidate, hit_title, entity.creator_or_author)
+            for candidate in extracted
+            for hit_title in _hit_titles(hit)
+        ):
             continue
         if not authors_overlap(entity.creator_or_author, hit.author_names):
             continue
@@ -327,9 +532,17 @@ def insert_succeeded(payload: object) -> bool:
     return inserted.get("id") is not None or inserted.get("user_book") is not None
 
 
+TitleTranslator = Callable[[Entity], Awaitable[str]]
+
+
 class HardcoverClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        title_translator: TitleTranslator | None = None,
+    ) -> None:
         self._settings = settings
+        self._title_translator = title_translator
         self._client = httpx.AsyncClient(timeout=settings.hardcover_timeout_seconds)
 
     @property
@@ -368,20 +581,35 @@ class HardcoverClient:
         return actions
 
     async def _sync_one(self, entity: Entity) -> HardcoverAction:
-        query = hardcover_search_query(entity)
-        if not query:
+        queries = hardcover_search_queries(entity)
+        if not queries:
             return HardcoverAction(
                 entity_name=entity.name,
                 outcome=HardcoverOutcome.no_match,
             )
-        search_payload = await self._graphql(SEARCH_QUERY, {"query": query})
-        if search_payload is None:
+        match, errored = await self._search_queries(entity, queries)
+        if errored:
             return HardcoverAction(
                 entity_name=entity.name,
                 outcome=HardcoverOutcome.error,
             )
-        match = pick_match(entity, parse_search_hits(_search_results(search_payload)))
         if match is None:
+            fallback, extra_titles = await self._catalog_title_queries(entity)
+            if fallback:
+                match, errored = await self._search_queries(
+                    entity, fallback, extra_titles
+                )
+                if errored:
+                    return HardcoverAction(
+                        entity_name=entity.name,
+                        outcome=HardcoverOutcome.error,
+                    )
+        if match is None:
+            logger.info(
+                "hardcover no_match name=%r author=%r",
+                entity.name,
+                entity.creator_or_author,
+            )
             return HardcoverAction(
                 entity_name=entity.name,
                 outcome=HardcoverOutcome.no_match,
@@ -418,6 +646,77 @@ class HardcoverClient:
             status_label=STATUS_LABELS[WANT_TO_READ_STATUS_ID],
             hardcover_url=match.url,
         )
+
+    async def _search_queries(
+        self,
+        entity: Entity,
+        queries: list[str],
+        extra_titles: list[str] | None = None,
+    ) -> tuple[Optional[HardcoverHit], bool]:
+        """Search each query. Returns (match, errored)."""
+        for query in queries:
+            search_payload = await self._graphql(SEARCH_QUERY, {"query": query})
+            if search_payload is None:
+                return None, True
+            hits = parse_search_hits(_search_results(search_payload))
+            match = pick_match(entity, hits, extra_titles=extra_titles)
+            if match is not None:
+                return match, False
+            logger.info(
+                "hardcover miss query=%r name=%r candidates=%s hit_titles=%s",
+                query,
+                entity.name,
+                [*entity_title_candidates(entity), *(extra_titles or [])],
+                [hit.title for hit in hits],
+            )
+        return None, False
+
+    async def _catalog_title_queries(
+        self, entity: Entity
+    ) -> tuple[list[str], list[str]]:
+        """English or original catalog title after the extracted titles missed.
+
+        Author-only search is a worse query here: Hardcover returns five hits,
+        and annotated editions and summaries outrank the book itself. A catalog
+        title plus the author reuses the same strict matcher.
+        """
+        if self._title_translator is None or not title_needs_catalog_translation(
+            entity.name
+        ):
+            return [], []
+        try:
+            translated = (await self._title_translator(entity)).strip()
+        except Exception:
+            logger.warning(
+                "hardcover catalog title failed name=%r",
+                entity.name,
+                exc_info=True,
+            )
+            return [], []
+        if not translated:
+            logger.info("hardcover catalog title empty name=%r", entity.name)
+            return [], []
+        known = {
+            _title_dedupe_key(title) for title in entity_title_candidates(entity)
+        }
+        if _title_dedupe_key(translated) in known:
+            logger.info(
+                "hardcover catalog title already searched name=%r title=%r",
+                entity.name,
+                translated,
+            )
+            return [], []
+        query = _title_author_query(
+            _comma_to_colon_title(translated), entity.creator_or_author
+        )
+        if not query:
+            return [], []
+        logger.info(
+            "hardcover catalog title name=%r title=%r",
+            entity.name,
+            translated,
+        )
+        return [query], [translated]
 
     async def _existing_status(self, book_id: int) -> object:
         payload = await self._graphql(EXISTING_QUERY, {"bookId": book_id})
@@ -462,17 +761,17 @@ class HardcoverClient:
         return payload
 
 
-async def sync_then_save(
+async def sync_catalogs(
     settings: Settings,
     hardcover: HardcoverClient | None,
     result: ExtractionResult,
     letterboxd: LetterboxdClient | None = None,
-) -> tuple[Path, list[HardcoverAction], list[LetterboxdAction]]:
-    """Dispatch by entity type, then write the Obsidian note. Fail-soft.
+) -> tuple[list[HardcoverAction], list[LetterboxdAction]]:
+    """Dispatch by entity type. Fail-soft. Does not write an Obsidian note.
 
     Books go to Hardcover; movies go to Letterboxd. A service is not called
-    when that type is absent (or the client is disabled). Mixed extracts hit
-    both. Tools and other types stay in the note only.
+    when that type is absent or the client is disabled. Mixed extracts hit
+    both. Saving the note is a separate, optional step.
     """
     hardcover_actions: list[HardcoverAction] = []
     letterboxd_actions: list[LetterboxdAction] = []
@@ -488,15 +787,4 @@ async def sync_then_save(
         ):
             letterboxd_actions = await letterboxd.sync_movies(result.entities)
             apply_letterboxd_actions(result.entities, letterboxd_actions)
-    path = await asyncio.to_thread(save_to_obsidian, settings, result)
-    return path, hardcover_actions, letterboxd_actions
-
-
-async def sync_hardcover_then_save(
-    settings: Settings,
-    hardcover: HardcoverClient | None,
-    result: ExtractionResult,
-) -> tuple[Path, list[HardcoverAction]]:
-    """Books-only wrapper around sync_then_save."""
-    path, actions, _letterboxd = await sync_then_save(settings, hardcover, result)
-    return path, actions
+    return hardcover_actions, letterboxd_actions

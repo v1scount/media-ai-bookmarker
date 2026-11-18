@@ -17,20 +17,23 @@ from telegram.ext import (
     filters,
 )
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.hardcover import (
+    HardcoverAction,
     HardcoverClient,
     format_hardcover_report,
-    sync_then_save,
+    select_hardcover_candidates,
+    sync_catalogs,
 )
 from app.kagi import KagiClient
 from app.letterboxd import (
+    LetterboxdAction,
     LetterboxdClient,
     format_letterboxd_report,
     select_letterboxd_candidates,
 )
 from app.models import ExtractionResult, extract_supported_url
-from app.obsidian import relative_vault_path
+from app.obsidian import relative_vault_path, save_to_obsidian
 from app.openrouter import OpenRouterClient
 from app.pipeline import Pipeline, format_preview
 
@@ -91,6 +94,55 @@ def _save_keyboard(result_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def _catalog_progress(
+    settings: Settings,
+    hardcover: HardcoverClient | None,
+    letterboxd: LetterboxdClient | None,
+    result: ExtractionResult,
+) -> str | None:
+    """Status line before a catalog write. None when neither service will run."""
+    books = (
+        hardcover is not None
+        and hardcover.enabled
+        and bool(
+            select_hardcover_candidates(
+                result.entities, settings.hardcover_books_per_job
+            )
+        )
+    )
+    movies = (
+        letterboxd is not None
+        and letterboxd.enabled
+        and bool(
+            select_letterboxd_candidates(
+                result.entities, settings.letterboxd_movies_per_job
+            )
+        )
+    )
+    if books and movies:
+        return "Adding books to Hardcover and movies to Letterboxd…"
+    if movies:
+        return "Adding movies to Letterboxd…"
+    if books:
+        return "Adding books to Hardcover…"
+    return None
+
+
+def _catalog_report(
+    hardcover_actions: list[HardcoverAction],
+    letterboxd_actions: list[LetterboxdAction],
+) -> str:
+    parts = [
+        report
+        for report in (
+            format_hardcover_report(hardcover_actions),
+            format_letterboxd_report(letterboxd_actions),
+        )
+        if report
+    ]
+    return "\n\n".join(parts)
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
     user = update.effective_user
@@ -100,7 +152,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "Send me a TikTok or X (Twitter) link. I'll extract tools, books, movies, "
-        "and music recommendations, then let you save a Markdown note to Obsidian."
+        "and music. Books go to Hardcover and movies to Letterboxd when those are "
+        "configured. Saving a Markdown note to Obsidian is optional."
     )
 
 
@@ -154,6 +207,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
 
+    hardcover: HardcoverClient | None = context.application.bot_data.get("hardcover")
+    letterboxd: LetterboxdClient | None = context.application.bot_data.get("letterboxd")
+    hardcover_actions: list[HardcoverAction] = []
+    letterboxd_actions: list[LetterboxdAction] = []
+    sync_note = ""
+
     async with job_lock:
         try:
             result = await pipeline.run(url, progress_cb=progress_cb)
@@ -168,18 +227,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await status.edit_text(f"Failed to process link:\n{err}")
             return
 
+        notice = _catalog_progress(settings, hardcover, letterboxd, result)
+        if notice:
+            await progress_cb(notice)
+        try:
+            hardcover_actions, letterboxd_actions = await sync_catalogs(
+                settings, hardcover, result, letterboxd
+            )
+        except Exception:
+            logger.exception("Catalog sync failed for %s", url)
+            sync_note = "Could not update Hardcover or Letterboxd."
+
     result_id = await _store_result(result)
     preview = format_preview(result, amazon_host=settings.amazon_search_host)
     # Telegram message limit ~4096; trim if needed
     if len(preview) > 3900:
         preview = preview[:3900] + "\n…"
 
+    reply_markup = _save_keyboard(result_id)
     try:
         await status.edit_text(
             preview,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=_save_keyboard(result_id),
+            reply_markup=reply_markup,
         )
     except Exception:
         # Fallback without HTML if Telegram rejects entities
@@ -189,9 +260,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"- [{e.type.value}] {e.name}" for e in result.entities
             )
             + f"\n\n{result.source_url}",
-            reply_markup=_save_keyboard(result_id),
+            reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
+
+    report = _catalog_report(hardcover_actions, letterboxd_actions)
+    if sync_note:
+        report = f"{sync_note}\n\n{report}" if report else sync_note
+    if report:
+        await message.reply_text(report)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -216,7 +293,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception:
             pass
         if query.message:
-            await query.message.reply_text("Dismissed. Nothing saved.")
+            await query.message.reply_text("Dismissed. Note not saved.")
         return
 
     if data.startswith("save:"):
@@ -227,26 +304,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer()
         try:
-            hardcover: HardcoverClient | None = context.application.bot_data.get(
-                "hardcover"
-            )
-            letterboxd: LetterboxdClient | None = context.application.bot_data.get(
-                "letterboxd"
-            )
-            if (
-                query.message
-                and letterboxd is not None
-                and letterboxd.enabled
-                and select_letterboxd_candidates(
-                    result.entities, settings.letterboxd_movies_per_job
-                )
-            ):
-                await query.message.reply_text(
-                    "Saving… Letterboxd can take a minute."
-                )
-            path, hardcover_actions, letterboxd_actions = await sync_then_save(
-                settings, hardcover, result, letterboxd
-            )
+            path = await asyncio.to_thread(save_to_obsidian, settings, result)
             rel = relative_vault_path(settings, path)
             await _pop_result(result_id)
             try:
@@ -254,15 +312,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception:
                 pass
             if query.message:
-                lines = [f"Saved to Obsidian:\n`{rel}`"]
-                for report in (
-                    format_hardcover_report(hardcover_actions),
-                    format_letterboxd_report(letterboxd_actions),
-                ):
-                    if report:
-                        lines.extend(["", report])
                 await query.message.reply_text(
-                    "\n".join(lines),
+                    f"Saved to Obsidian:\n`{rel}`",
                     parse_mode=ParseMode.MARKDOWN,
                 )
         except Exception as exc:
@@ -282,7 +333,9 @@ async def post_init(application: Application) -> None:
     settings = get_settings()
     openrouter = OpenRouterClient(settings)
     kagi = KagiClient(settings)
-    hardcover = HardcoverClient(settings)
+    hardcover = HardcoverClient(
+        settings, title_translator=openrouter.book_catalog_title
+    )
     letterboxd = LetterboxdClient(settings)
     pipeline = Pipeline(settings, openrouter, kagi)
     application.bot_data["settings"] = settings
