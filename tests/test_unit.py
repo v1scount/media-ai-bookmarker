@@ -38,7 +38,12 @@ from app.models import (
     split_caption,
     year_from_text,
 )
-from app.obsidian import build_note_filename, render_markdown, save_to_obsidian
+from app.obsidian import (
+    build_note_filename,
+    render_markdown,
+    save_to_obsidian,
+    wants_obsidian_note,
+)
 from app.openrouter import RESULT_JSON_SCHEMA, truncate_text
 from app.pipeline import (
     Pipeline,
@@ -46,6 +51,7 @@ from app.pipeline import (
     build_post_content,
     format_preview,
     has_analysable_content,
+    x_needs_video_analysis,
 )
 from app.xfetch import (
     LinkPreview,
@@ -435,6 +441,7 @@ class TokenGuardTests(unittest.TestCase):
         self.assertIn("alternate_names", entity_schema["required"])
         self.assertNotIn("letterboxd_url", entity_schema["properties"])
         self.assertNotIn("hardcover_url", entity_schema["properties"])
+        self.assertNotIn("goodreads_url", entity_schema["properties"])
 
     def test_every_schema_field_is_documented(self) -> None:
         entity_props = RESULT_JSON_SCHEMA["schema"]["properties"]["entities"]["items"][
@@ -888,6 +895,107 @@ class PipelineSkipTests(unittest.TestCase):
             description="caption",
         )
         self.assertFalse(has_analysable_content(artifacts, "", []))
+
+    def test_x_skips_video_when_post_has_text(self) -> None:
+        tweet = TweetData(
+            tweet_id="1",
+            text="Read Dune by Frank Herbert",
+            has_video=True,
+            video_urls=["https://video.twimg.com/b.mp4"],
+        )
+        self.assertFalse(x_needs_video_analysis(tweet, []))
+
+    def test_x_skips_video_when_quote_or_preview_has_signal(self) -> None:
+        quoted = TweetData(tweet_id="1", text="", quoted_text="See this book", has_video=True)
+        self.assertFalse(x_needs_video_analysis(quoted, []))
+        empty = TweetData(tweet_id="2", text="", has_video=True)
+        preview = [
+            LinkPreview(url="https://example.com/book", title="Dune", description="")
+        ]
+        self.assertFalse(x_needs_video_analysis(empty, preview))
+
+    def test_x_needs_video_when_no_text_or_previews(self) -> None:
+        tweet = TweetData(
+            tweet_id="1",
+            text="   ",
+            has_video=True,
+            video_urls=["https://video.twimg.com/b.mp4"],
+        )
+        self.assertTrue(x_needs_video_analysis(tweet, []))
+
+
+class PipelineXDownloadTests(unittest.TestCase):
+    def _pipeline(self, tmp: str) -> Pipeline:
+        settings = Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            OPENROUTER_API_KEY="x",
+            JOB_TMP_DIR=tmp,
+            RESULT_CACHE_SIZE=0,
+        )
+        return Pipeline(settings, unittest.mock.MagicMock())
+
+    def test_download_x_skips_video_when_text_is_enough(self) -> None:
+        tweet = TweetData(
+            tweet_id="1",
+            text="Read Dune by Frank Herbert",
+            author_handle="@alice",
+            has_video=True,
+            video_urls=["https://video.twimg.com/b.mp4"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = self._pipeline(tmp)
+            with (
+                unittest.mock.patch("app.xfetch.fetch_tweet", return_value=tweet),
+                unittest.mock.patch("app.xfetch.fetch_link_previews", return_value=[]),
+                unittest.mock.patch(
+                    "app.download.download_x_video",
+                    side_effect=AssertionError("X video should not download"),
+                ) as download_video,
+            ):
+                artifacts = pipeline._download_x(
+                    "https://x.com/alice/status/1", Path(tmp)
+                )
+
+            download_video.assert_not_called()
+            self.assertIsNone(artifacts.video_path)
+            self.assertIsNone(artifacts.audio_path)
+            self.assertEqual(artifacts.description, "Read Dune by Frank Herbert")
+
+    def test_download_x_fetches_video_when_post_is_empty(self) -> None:
+        tweet = TweetData(
+            tweet_id="2",
+            text="",
+            author_handle="@alice",
+            has_video=True,
+            video_urls=["https://video.twimg.com/b.mp4"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = self._pipeline(tmp)
+            work = Path(tmp)
+            fake_info = {"id": "2", "duration": 3.0}
+
+            def fake_prepare(info, work_dir, url):
+                video = work_dir / "media.mp4"
+                video.write_bytes(b"video")
+                return video, None, 3.0
+
+            with (
+                unittest.mock.patch("app.xfetch.fetch_tweet", return_value=tweet),
+                unittest.mock.patch("app.xfetch.fetch_link_previews", return_value=[]),
+                unittest.mock.patch(
+                    "app.download.download_x_video", return_value=fake_info
+                ) as download_video,
+                unittest.mock.patch.object(
+                    pipeline, "_prepare_media", side_effect=fake_prepare
+                ),
+            ):
+                artifacts = pipeline._download_x(
+                    "https://x.com/alice/status/2", work
+                )
+
+            download_video.assert_called_once()
+            self.assertIsNotNone(artifacts.video_path)
+            self.assertEqual(artifacts.video_path.name, "media.mp4")
 
 
 class PipelineXRunTests(unittest.IsolatedAsyncioTestCase):
@@ -2079,6 +2187,9 @@ class HardcoverHelperTests(unittest.TestCase):
         self.assertEqual(Settings.model_fields["hardcover_api_key"].default, "")
         self.assertEqual(Settings.model_fields["hardcover_books_per_job"].default, 8)
         self.assertEqual(Settings.model_fields["hardcover_timeout_seconds"].default, 15.0)
+        self.assertEqual(Settings.model_fields["goodreads_cookie"].default, "")
+        self.assertEqual(Settings.model_fields["goodreads_books_per_job"].default, 8)
+        self.assertEqual(Settings.model_fields["goodreads_timeout_seconds"].default, 20.0)
         self.assertEqual(Settings.model_fields["letterboxd_middleman_url"].default, "")
         self.assertEqual(Settings.model_fields["letterboxd_middleman_api_key"].default, "")
         self.assertEqual(Settings.model_fields["letterboxd_movies_per_job"].default, 4)
@@ -2774,14 +2885,15 @@ class HardcoverSaveTests(unittest.IsolatedAsyncioTestCase):
             client.sync_books = AsyncMock()  # type: ignore[method-assign]
             result = self._result()
             try:
-                hardcover_actions, letterboxd_actions = await sync_catalogs(
-                    settings, client, result
+                hardcover_actions, letterboxd_actions, goodreads_actions = (
+                    await sync_catalogs(settings, client, result)
                 )
             finally:
                 await client.aclose()
             client.sync_books.assert_not_awaited()
             self.assertEqual(hardcover_actions, [])
             self.assertEqual(letterboxd_actions, [])
+            self.assertEqual(goodreads_actions, [])
             self.assertFalse((Path(tmp) / "Extracts").exists())
             self.assertIsNone(result.entities[0].hardcover_url)
 
@@ -2818,12 +2930,13 @@ class HardcoverSaveTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             result = self._result()
-            hardcover_actions, letterboxd_actions = await sync_catalogs(
-                settings, client, result
+            hardcover_actions, letterboxd_actions, goodreads_actions = (
+                await sync_catalogs(settings, client, result)
             )
             client.sync_books.assert_awaited_once()
             self.assertEqual(hardcover_actions[0].outcome, HardcoverOutcome.added)
             self.assertEqual(letterboxd_actions, [])
+            self.assertEqual(goodreads_actions, [])
             self.assertEqual(
                 result.entities[0].hardcover_url,
                 "https://hardcover.app/books/dune",
@@ -3188,13 +3301,14 @@ class SyncCatalogsTests(unittest.IsolatedAsyncioTestCase):
             letterboxd = MagicMock(spec=LetterboxdClient)
             letterboxd.enabled = True
             letterboxd.sync_movies = AsyncMock(return_value=[])
-            hc_actions, lb_actions = await sync_catalogs(
+            hc_actions, lb_actions, gr_actions = await sync_catalogs(
                 settings, hardcover, self._book_result(), letterboxd
             )
             hardcover.sync_books.assert_awaited_once()
             letterboxd.sync_movies.assert_not_awaited()
             self.assertEqual(hc_actions, [])
             self.assertEqual(lb_actions, [])
+            self.assertEqual(gr_actions, [])
             self.assertFalse((Path(tmp) / "Extracts").exists())
 
     async def test_movies_only_never_calls_hardcover(self) -> None:
@@ -3228,13 +3342,14 @@ class SyncCatalogsTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             result = self._movie_result()
-            hc_actions, lb_actions = await sync_catalogs(
+            hc_actions, lb_actions, gr_actions = await sync_catalogs(
                 settings, hardcover, result, letterboxd
             )
             hardcover.sync_books.assert_not_awaited()
             letterboxd.sync_movies.assert_awaited_once()
             self.assertEqual(hc_actions, [])
             self.assertEqual(lb_actions[0].outcome, LetterboxdOutcome.added)
+            self.assertEqual(gr_actions, [])
             self.assertEqual(
                 result.entities[0].letterboxd_url,
                 "https://letterboxd.com/film/inception/",
@@ -3336,10 +3451,13 @@ class SyncCatalogsTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             result = self._book_result(SourceKind.x)
-            actions, lb_actions = await sync_catalogs(settings, hardcover, result)
+            actions, lb_actions, gr_actions = await sync_catalogs(
+                settings, hardcover, result
+            )
             hardcover.sync_books.assert_awaited_once()
             self.assertEqual(actions[0].outcome, HardcoverOutcome.added)
             self.assertEqual(lb_actions, [])
+            self.assertEqual(gr_actions, [])
             self.assertEqual(result.source_kind, SourceKind.x)
             self.assertFalse((Path(tmp) / "Extracts").exists())
 
@@ -3368,10 +3486,11 @@ class SyncCatalogsTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             result = self._movie_result()
-            _hc, lb_actions = await sync_catalogs(
+            _hc, lb_actions, gr_actions = await sync_catalogs(
                 settings, hardcover, result, letterboxd
             )
             self.assertEqual(lb_actions[0].outcome, LetterboxdOutcome.error)
+            self.assertEqual(gr_actions, [])
             self.assertIsNone(result.entities[0].letterboxd_url)
             self.assertFalse((Path(tmp) / "Extracts").exists())
             path = save_to_obsidian(settings, result)
@@ -3401,11 +3520,441 @@ class LetterboxdObsidianTests(unittest.TestCase):
         self.assertIn("letterboxd", preview)
 
 
+class GoodreadsHelperTests(unittest.TestCase):
+    def test_cookie_header_accepts_bare_session(self) -> None:
+        from app.goodreads import cookie_header
+
+        self.assertEqual(cookie_header("abc"), "_session_id2=abc")
+        self.assertEqual(
+            cookie_header("_session_id2=abc; other=1"),
+            "_session_id2=abc; other=1",
+        )
+        self.assertEqual(cookie_header("Cookie: _session_id2=abc"), "_session_id2=abc")
+
+    def test_parse_autocomplete_and_pick_match(self) -> None:
+        from app.goodreads import parse_autocomplete_hits, pick_match
+
+        hits = parse_autocomplete_hits(
+            [
+                {
+                    "bookId": "110",
+                    "title": "The Road to Dune",
+                    "bookTitleBare": "The Road to Dune",
+                    "bookUrl": "/book/show/110.The_Road_to_Dune",
+                    "author": {"name": "Frank Herbert"},
+                },
+                {
+                    "bookId": "44767458",
+                    "title": "Dune (Dune, #1)",
+                    "bookTitleBare": "Dune",
+                    "bookUrl": "/book/show/44767458-dune",
+                    "author": {"name": "Frank Herbert"},
+                },
+            ]
+        )
+        self.assertEqual(hits[1].url, "https://www.goodreads.com/book/show/44767458-dune")
+        entity = Entity(
+            type=EntityType.book,
+            name="Dune",
+            creator_or_author="Frank Herbert",
+            confidence=Confidence.high,
+        )
+        match = pick_match(entity, hits)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.book_id, "44767458")
+
+    def test_parse_csrf_and_existing_shelf(self) -> None:
+        from app.goodreads import parse_csrf_token, parse_existing_shelf
+
+        html = (
+            '<meta name="csrf-token" content="tok123">'
+            '<select name="shelf">'
+            '<option value="to-read">Want to Read</option>'
+            '<option selected value="read">Read</option>'
+            "</select>"
+        )
+        self.assertEqual(parse_csrf_token(html), "tok123")
+        self.assertEqual(parse_existing_shelf(html), "read")
+        self.assertIsNone(parse_existing_shelf("<html></html>"))
+
+    def test_select_candidates_skips_low_confidence(self) -> None:
+        from app.goodreads import select_goodreads_candidates
+
+        items = [
+            Entity(
+                type=EntityType.book,
+                name="Main",
+                is_main_topic=True,
+                confidence=Confidence.high,
+            ),
+            Entity(
+                type=EntityType.book,
+                name="Aside",
+                is_main_topic=False,
+                confidence=Confidence.medium,
+            ),
+            Entity(
+                type=EntityType.book,
+                name="Nope",
+                is_main_topic=True,
+                confidence=Confidence.low,
+            ),
+            Entity(
+                type=EntityType.movie,
+                name="Film",
+                confidence=Confidence.high,
+            ),
+        ]
+        self.assertEqual(
+            [entity.name for entity in select_goodreads_candidates(items, 2)],
+            ["Main", "Aside"],
+        )
+        self.assertEqual(select_goodreads_candidates(items, 0), [])
+
+
+class GoodreadsHttpTests(unittest.IsolatedAsyncioTestCase):
+    def _settings(self, **overrides: object) -> Settings:
+        values: dict[str, object] = {
+            "TELEGRAM_BOT_TOKEN": "x",
+            "OPENROUTER_API_KEY": "x",
+            "GOODREADS_COOKIE": "_session_id2=secret",
+        }
+        values.update(overrides)
+        return Settings(**values)  # type: ignore[arg-type]
+
+    def _book(self) -> Entity:
+        return Entity(
+            type=EntityType.book,
+            name="Dune",
+            creator_or_author="Frank Herbert",
+            is_main_topic=True,
+            confidence=Confidence.high,
+        )
+
+    async def test_disabled_without_cookie(self) -> None:
+        from app.goodreads import GoodreadsClient
+
+        client = GoodreadsClient(self._settings(GOODREADS_COOKIE=""))
+        try:
+            self.assertFalse(client.enabled)
+            self.assertEqual(await client.sync_books([self._book()]), [])
+        finally:
+            await client.aclose()
+
+    async def test_disabled_with_zero_per_job(self) -> None:
+        from app.goodreads import GoodreadsClient
+
+        client = GoodreadsClient(self._settings(GOODREADS_BOOKS_PER_JOB=0))
+        try:
+            self.assertFalse(client.enabled)
+            self.assertEqual(await client.sync_books([self._book()]), [])
+        finally:
+            await client.aclose()
+
+    async def test_adds_want_to_read(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import httpx
+
+        from app.goodreads import GoodreadsClient, GoodreadsOutcome
+
+        client = GoodreadsClient(self._settings())
+        autocomplete = httpx.Response(
+            200,
+            json=[
+                {
+                    "bookId": "44767458",
+                    "title": "Dune (Dune, #1)",
+                    "bookTitleBare": "Dune",
+                    "bookUrl": "/book/show/44767458-dune",
+                    "author": {"name": "Frank Herbert"},
+                }
+            ],
+            request=httpx.Request("GET", "https://www.goodreads.com/book/auto_complete"),
+        )
+        review_edit = httpx.Response(
+            404,
+            text="missing",
+            request=httpx.Request("GET", "https://www.goodreads.com/review/edit/1"),
+        )
+        review_list = httpx.Response(
+            200,
+            text='<meta name="csrf-token" content="csrf-token">',
+            request=httpx.Request("GET", "https://www.goodreads.com/review/list"),
+        )
+        add = httpx.Response(
+            200,
+            text="ok",
+            request=httpx.Request("POST", "https://www.goodreads.com/shelf/add_to_shelf"),
+        )
+
+        async def fake_get(url: str, **kwargs: object) -> httpx.Response:
+            if "auto_complete" in str(url):
+                return autocomplete
+            if "review/edit" in str(url):
+                return review_edit
+            if "review/list" in str(url):
+                return review_list
+            raise AssertionError(url)
+
+        try:
+            with patch.object(client._client, "get", new=AsyncMock(side_effect=fake_get)):
+                with patch.object(
+                    client._client, "post", new=AsyncMock(return_value=add)
+                ) as post:
+                    actions = await client.sync_books([self._book()])
+            self.assertEqual(actions[0].outcome, GoodreadsOutcome.added)
+            self.assertEqual(actions[0].status_label, "Want to Read")
+            self.assertEqual(
+                actions[0].goodreads_url,
+                "https://www.goodreads.com/book/show/44767458-dune",
+            )
+            post.assert_awaited_once()
+            self.assertEqual(post.await_args.kwargs["data"]["name"], "to-read")
+            self.assertEqual(post.await_args.kwargs["data"]["book_id"], "44767458")
+        finally:
+            await client.aclose()
+
+    async def test_already_on_shelf_left_alone(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import httpx
+
+        from app.goodreads import GoodreadsClient, GoodreadsOutcome
+
+        client = GoodreadsClient(self._settings())
+        autocomplete = httpx.Response(
+            200,
+            json=[
+                {
+                    "bookId": "44767458",
+                    "title": "Dune",
+                    "bookTitleBare": "Dune",
+                    "bookUrl": "/book/show/44767458-dune",
+                    "author": {"name": "Frank Herbert"},
+                }
+            ],
+            request=httpx.Request("GET", "https://www.goodreads.com/book/auto_complete"),
+        )
+        review_edit = httpx.Response(
+            200,
+            text=(
+                '<meta name="csrf-token" content="csrf-token">'
+                '<option selected value="currently-reading">Currently Reading</option>'
+            ),
+            request=httpx.Request("GET", "https://www.goodreads.com/review/edit/1"),
+        )
+
+        async def fake_get(url: str, **kwargs: object) -> httpx.Response:
+            if "auto_complete" in str(url):
+                return autocomplete
+            if "review/edit" in str(url):
+                return review_edit
+            raise AssertionError(url)
+
+        try:
+            with patch.object(client._client, "get", new=AsyncMock(side_effect=fake_get)):
+                with patch.object(client._client, "post", new=AsyncMock()) as post:
+                    actions = await client.sync_books([self._book()])
+            self.assertEqual(actions[0].outcome, GoodreadsOutcome.already_on_shelf)
+            self.assertEqual(actions[0].status_label, "Currently Reading")
+            post.assert_not_awaited()
+        finally:
+            await client.aclose()
+
+    async def test_no_match(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import httpx
+
+        from app.goodreads import GoodreadsClient, GoodreadsOutcome
+
+        client = GoodreadsClient(self._settings())
+        autocomplete = httpx.Response(
+            200,
+            json=[
+                {
+                    "bookId": "1",
+                    "title": "Something Else",
+                    "bookTitleBare": "Something Else",
+                    "bookUrl": "/book/show/1",
+                    "author": {"name": "Other"},
+                }
+            ],
+            request=httpx.Request("GET", "https://www.goodreads.com/book/auto_complete"),
+        )
+        try:
+            with patch.object(
+                client._client, "get", new=AsyncMock(return_value=autocomplete)
+            ):
+                actions = await client.sync_books([self._book()])
+            self.assertEqual(actions[0].outcome, GoodreadsOutcome.no_match)
+            self.assertEqual(actions[0].goodreads_url, "")
+        finally:
+            await client.aclose()
+
+
+class GoodreadsSaveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sync_stamps_url_and_note_stays_optional(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.goodreads import GoodreadsAction, GoodreadsClient, GoodreadsOutcome
+        from app.hardcover import sync_catalogs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                TELEGRAM_BOT_TOKEN="x",
+                OPENROUTER_API_KEY="x",
+                OBSIDIAN_VAULT_PATH=tmp,
+                OBSIDIAN_RELATIVE_DIR="Extracts",
+                GOODREADS_COOKIE="_session_id2=secret",
+                PUID=-1,
+                PGID=-1,
+            )
+            client = MagicMock(spec=GoodreadsClient)
+            client.enabled = True
+            client.sync_books = AsyncMock(
+                return_value=[
+                    GoodreadsAction(
+                        entity_name="Dune",
+                        outcome=GoodreadsOutcome.added,
+                        status_label="Want to Read",
+                        goodreads_url="https://www.goodreads.com/book/show/44767458-dune",
+                    )
+                ]
+            )
+            result = ExtractionResult(
+                source_url="https://www.tiktok.com/@u/video/1",
+                title="Book Rec",
+                summary="A novel.",
+                video_kind=VideoKind.single,
+                entities=[
+                    Entity(
+                        type=EntityType.book,
+                        name="Dune",
+                        creator_or_author="Frank Herbert",
+                        is_main_topic=True,
+                        confidence=Confidence.high,
+                    )
+                ],
+            )
+            hc_actions, lb_actions, gr_actions = await sync_catalogs(
+                settings, None, result, goodreads=client
+            )
+            client.sync_books.assert_awaited_once()
+            self.assertEqual(hc_actions, [])
+            self.assertEqual(lb_actions, [])
+            self.assertEqual(gr_actions[0].outcome, GoodreadsOutcome.added)
+            self.assertEqual(
+                result.entities[0].goodreads_url,
+                "https://www.goodreads.com/book/show/44767458-dune",
+            )
+            self.assertFalse((Path(tmp) / "Extracts").exists())
+            note = save_to_obsidian(settings, result).read_text(encoding="utf-8")
+            self.assertIn(
+                "[goodreads](https://www.goodreads.com/book/show/44767458-dune)",
+                note,
+            )
+
+
+class ObsidianEligibilityTests(unittest.TestCase):
+    def test_book_or_movie_only_skips_vault(self) -> None:
+        book = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Book",
+            entities=[
+                Entity(type=EntityType.book, name="Dune", confidence=Confidence.high)
+            ],
+        )
+        movie = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/2",
+            title="Film",
+            entities=[
+                Entity(
+                    type=EntityType.movie, name="Inception", confidence=Confidence.high
+                )
+            ],
+        )
+        both = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/3",
+            title="Mix catalog",
+            entities=[*book.entities, *movie.entities],
+        )
+        self.assertFalse(wants_obsidian_note(book))
+        self.assertFalse(wants_obsidian_note(movie))
+        self.assertFalse(wants_obsidian_note(both))
+
+    def test_tools_news_and_mixed_still_get_notes(self) -> None:
+        tool = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Tool",
+            entities=[
+                Entity(type=EntityType.tool, name="Obsidian", confidence=Confidence.high)
+            ],
+        )
+        article = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/2",
+            title="News",
+            entities=[
+                Entity(
+                    type=EntityType.article,
+                    name="Some essay",
+                    confidence=Confidence.high,
+                )
+            ],
+        )
+        mixed = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/3",
+            title="Book plus tool",
+            entities=[
+                Entity(type=EntityType.book, name="Dune", confidence=Confidence.high),
+                Entity(type=EntityType.tool, name="Kindle", confidence=Confidence.high),
+            ],
+        )
+        empty = ExtractionResult(
+            source_url="https://x.com/u/status/1",
+            source_kind=SourceKind.x,
+            title="Verbatim post",
+        )
+        self.assertTrue(wants_obsidian_note(tool))
+        self.assertTrue(wants_obsidian_note(article))
+        self.assertTrue(wants_obsidian_note(mixed))
+        self.assertTrue(wants_obsidian_note(empty))
+
+
+class GoodreadsObsidianTests(unittest.TestCase):
+    def test_bullet_includes_goodreads_link(self) -> None:
+        result = ExtractionResult(
+            source_url="https://www.tiktok.com/@u/video/1",
+            title="Book Rec",
+            summary="A novel.",
+            video_kind=VideoKind.single,
+            entities=[
+                Entity(
+                    type=EntityType.book,
+                    name="Dune",
+                    creator_or_author="Frank Herbert",
+                    is_main_topic=True,
+                    goodreads_url="https://www.goodreads.com/book/show/44767458-dune",
+                )
+            ],
+        )
+        md = render_markdown(result)
+        self.assertIn(
+            "[goodreads](https://www.goodreads.com/book/show/44767458-dune)",
+            md,
+        )
+        preview = format_preview(result)
+        self.assertIn("goodreads", preview)
+
+
 class CatalogProgressTests(unittest.TestCase):
     def test_progress_follows_the_media_that_will_be_written(self) -> None:
         from unittest.mock import MagicMock
 
         from app.bot import _catalog_progress, _catalog_report
+        from app.goodreads import GoodreadsAction, GoodreadsClient, GoodreadsOutcome
         from app.hardcover import HardcoverAction, HardcoverClient, HardcoverOutcome
         from app.letterboxd import LetterboxdAction, LetterboxdClient, LetterboxdOutcome
 
@@ -3413,11 +3962,14 @@ class CatalogProgressTests(unittest.TestCase):
             TELEGRAM_BOT_TOKEN="x",
             OPENROUTER_API_KEY="x",
             HARDCOVER_API_KEY="secret",
+            GOODREADS_COOKIE="_session_id2=secret",
             LETTERBOXD_MIDDLEMAN_URL="http://127.0.0.1:8787",
             LETTERBOXD_MIDDLEMAN_API_KEY="secret",
         )
         hardcover = MagicMock(spec=HardcoverClient)
         hardcover.enabled = True
+        goodreads = MagicMock(spec=GoodreadsClient)
+        goodreads.enabled = True
         letterboxd = MagicMock(spec=LetterboxdClient)
         letterboxd.enabled = True
         book = ExtractionResult(
@@ -3453,18 +4005,20 @@ class CatalogProgressTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            _catalog_progress(settings, hardcover, letterboxd, book),
-            "Adding books to Hardcover…",
+            _catalog_progress(settings, hardcover, letterboxd, book, goodreads),
+            "Adding books to Hardcover and Goodreads…",
         )
         self.assertEqual(
-            _catalog_progress(settings, hardcover, letterboxd, movie),
+            _catalog_progress(settings, hardcover, letterboxd, movie, goodreads),
             "Adding movies to Letterboxd…",
         )
         self.assertEqual(
-            _catalog_progress(settings, hardcover, letterboxd, both),
-            "Adding books to Hardcover and movies to Letterboxd…",
+            _catalog_progress(settings, hardcover, letterboxd, both, goodreads),
+            "Adding books to Hardcover and Goodreads and movies to Letterboxd…",
         )
-        self.assertIsNone(_catalog_progress(settings, hardcover, letterboxd, tool))
+        self.assertIsNone(
+            _catalog_progress(settings, hardcover, letterboxd, tool, goodreads)
+        )
         self.assertEqual(
             _catalog_report(
                 [
@@ -3479,8 +4033,15 @@ class CatalogProgressTests(unittest.TestCase):
                         outcome=LetterboxdOutcome.added,
                     )
                 ],
+                [
+                    GoodreadsAction(
+                        entity_name="Dune",
+                        outcome=GoodreadsOutcome.added,
+                    )
+                ],
             ),
             "Hardcover: added Dune as Want to Read\n\n"
+            "Goodreads: added Dune as Want to Read\n\n"
             "Letterboxd: added Inception to watchlist",
         )
 

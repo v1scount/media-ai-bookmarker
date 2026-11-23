@@ -1,7 +1,8 @@
 """CLI harness to test the extraction pipeline without Telegram.
 
-Books go to Hardcover and movies to Letterboxd when those are configured.
-`--save` also writes the Obsidian note.
+Books go to Hardcover/Goodreads and movies to Letterboxd when those are
+configured. `--save` writes an Obsidian note for tools, news, and other
+non-catalog items (book/movie-only extracts are skipped).
 
 Usage:
   python -m app.cli "https://www.tiktok.com/@user/video/123"
@@ -18,6 +19,7 @@ import logging
 import sys
 
 from app.config import get_settings
+from app.goodreads import GoodreadsClient, format_goodreads_report
 from app.hardcover import (
     HardcoverClient,
     format_hardcover_report,
@@ -26,7 +28,7 @@ from app.hardcover import (
 from app.kagi import KagiClient
 from app.letterboxd import LetterboxdClient, format_letterboxd_report
 from app.models import extract_supported_url
-from app.obsidian import relative_vault_path, save_to_obsidian
+from app.obsidian import relative_vault_path, save_to_obsidian, wants_obsidian_note
 from app.openrouter import OpenRouterClient
 from app.pipeline import Pipeline, format_preview
 
@@ -43,6 +45,9 @@ async def _run(url: str, save: bool) -> int:
     hardcover = HardcoverClient(
         settings, title_translator=openrouter.book_catalog_title
     )
+    goodreads = GoodreadsClient(
+        settings, title_translator=openrouter.book_catalog_title
+    )
     letterboxd = LetterboxdClient(settings)
     pipeline = Pipeline(settings, openrouter, kagi)
     try:
@@ -57,23 +62,34 @@ async def _run(url: str, save: bool) -> int:
         # Strip HTML tags roughly for console
         preview = format_preview(result, amazon_host=settings.amazon_search_host)
         print(preview.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<code>", "`").replace("</code>", "`"))
-        hardcover_actions, letterboxd_actions = await sync_catalogs(
-            settings, hardcover, result, letterboxd
+        hardcover_actions, letterboxd_actions, goodreads_actions = (
+            await sync_catalogs(
+                settings, hardcover, result, letterboxd, goodreads
+            )
         )
         for report in (
             format_hardcover_report(hardcover_actions),
+            format_goodreads_report(goodreads_actions),
             format_letterboxd_report(letterboxd_actions),
         ):
             if report:
                 print(report)
         if save:
-            path = await asyncio.to_thread(save_to_obsidian, settings, result)
-            print(f"\nSaved: {relative_vault_path(settings, path)}")
+            if wants_obsidian_note(result):
+                path = await asyncio.to_thread(save_to_obsidian, settings, result)
+                print(f"\nSaved: {relative_vault_path(settings, path)}")
+            else:
+                print(
+                    "\nSkipping Obsidian: extract is only books/movies "
+                    "(use Hardcover, Goodreads, or Letterboxd).",
+                    flush=True,
+                )
         return 0
     finally:
         await openrouter.aclose()
         await kagi.aclose()
         await hardcover.aclose()
+        await goodreads.aclose()
         await letterboxd.aclose()
 
 
@@ -81,14 +97,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run the TikTok / X extraction pipeline. "
-            "Books and movies are sent to Hardcover and Letterboxd when configured."
+            "Books and movies are sent to Hardcover, Goodreads, and Letterboxd "
+            "when configured."
         )
     )
     parser.add_argument("url", help="TikTok or X post URL")
     parser.add_argument(
         "--save",
         action="store_true",
-        help="Also write a Markdown note into the Obsidian vault",
+        help=(
+            "Also write a Markdown note into the Obsidian vault "
+            "(skipped for book/movie-only extracts)"
+        ),
     )
     args = parser.parse_args(argv)
 

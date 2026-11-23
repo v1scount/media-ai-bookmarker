@@ -210,6 +210,7 @@ class Entity(BaseModel):
     confidence: Confidence = Confidence.medium
     suggested_link: Optional[str] = None
     hardcover_url: Optional[str] = None
+    goodreads_url: Optional[str] = None
     letterboxd_url: Optional[str] = None
     # Release year when the model (or a trailing "(2010)") knows it
     year: Optional[int] = None
@@ -235,7 +236,13 @@ class Entity(BaseModel):
             ]
         return []
 
-    @field_validator("suggested_link", "hardcover_url", "letterboxd_url", mode="before")
+    @field_validator(
+        "suggested_link",
+        "hardcover_url",
+        "goodreads_url",
+        "letterboxd_url",
+        mode="before",
+    )
     @classmethod
     def empty_link_to_none(cls, value: object) -> object:
         if value is None:

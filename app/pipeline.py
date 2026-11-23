@@ -301,6 +301,8 @@ class Pipeline:
 
         # Media is only fetched here to feed the model. A raw capture records the
         # URLs instead, and downloads photos straight into the vault on save.
+        # Video (yt-dlp → whisper/frames) is the TikTok path: skip it on X when
+        # the post body or linked pages already give the model enough to work with.
         photos: list[Path] = []
         video_path: Path | None = None
         audio_path: Path | None = None
@@ -312,7 +314,7 @@ class Pipeline:
                     work_dir / "photos",
                     limit=self.settings.frame_count,
                 )
-            if tweet.has_video:
+            if tweet.has_video and x_needs_video_analysis(tweet, link_previews):
                 try:
                     info = download_x_video(
                         canonical,
@@ -325,6 +327,11 @@ class Pipeline:
                 except Exception as exc:
                     # The tweet text and its links are still worth extracting
                     logger.warning("X video download failed for %s: %s", canonical, exc)
+            elif tweet.has_video:
+                logger.info(
+                    "Skipping X video for %s: post text/links are enough",
+                    tweet.tweet_id,
+                )
 
         logger.info(
             "Tweet %s: photos=%s videos=%s links=%s llm=%s",
@@ -641,6 +648,24 @@ def tweet_title(text: str, handle: str = "") -> str:
     return collapsed[:MAX_TWEET_TITLE_CHARS].rstrip() + "…"
 
 
+def x_needs_video_analysis(
+    tweet: TweetData,
+    link_previews: list[LinkPreview],
+) -> bool:
+    """Whether an attached X clip should be downloaded for the model.
+
+    Video transcription and frame sampling exist mainly for TikTok. On X, skip
+    that work when the post body (including a quote) or a linked-page preview
+    already gives the model something to extract from.
+    """
+    description = (tweet.text or "").strip()
+    if tweet.quoted_text:
+        description = f"{description}\n{tweet.quoted_text.strip()}".strip()
+    if description or link_previews:
+        return False
+    return True
+
+
 def has_analysable_content(
     artifacts: SourceArtifacts,
     transcript: str,
@@ -737,6 +762,8 @@ def _preview_entity_links(entity: Entity, amazon_host: str) -> str:
         parts.append(f'<a href="{_html(entity.search_url)}">search</a>')
     if entity.hardcover_url:
         parts.append(f'<a href="{_html(entity.hardcover_url)}">hardcover</a>')
+    if entity.goodreads_url:
+        parts.append(f'<a href="{_html(entity.goodreads_url)}">goodreads</a>')
     if entity.letterboxd_url:
         parts.append(f'<a href="{_html(entity.letterboxd_url)}">letterboxd</a>')
     if not parts:

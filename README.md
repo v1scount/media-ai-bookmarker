@@ -1,6 +1,6 @@
 # TikTok / X → Telegram → Obsidian Extractor
 
-Self-hosted bot: send a TikTok or X (Twitter) link on Telegram → local extraction → OpenRouter multimodal extraction → books to Hardcover and movies to Letterboxd. Saving a Markdown note into your Obsidian vault is optional.
+Self-hosted bot: send a TikTok or X (Twitter) link on Telegram → local extraction → OpenRouter multimodal extraction → books to Hardcover/Goodreads and movies to Letterboxd. Tools, news, and other non-catalog items can optionally be saved as an Obsidian note (book/movie-only extracts skip the vault).
 
 - **TikTok:** `yt-dlp` download → `faster-whisper` transcript + sampled frames → model extraction.
 - **X:** same model extraction by default (post text, linked pages, photos, and video when present). Set `X_USE_LLM=false` to save the post verbatim with no model call.
@@ -40,6 +40,8 @@ cp .env.example .env
 | `KAGI_SEARCH_PER_JOB` | Max Kagi API searches per video (default `3`; `0` disables the API) |
 | `HARDCOVER_API_KEY` | Optional. From [Hardcover API settings](https://docs.hardcover.app/api/getting-started/). Empty = skip Hardcover |
 | `HARDCOVER_BOOKS_PER_JOB` | Max books to look up per post (default `8`; `0` disables) |
+| `GOODREADS_COOKIE` | Optional. Logged-in Goodreads `_session_id2` cookie (or a full `Cookie` header). Empty = skip Goodreads |
+| `GOODREADS_BOOKS_PER_JOB` | Max books to look up per post (default `8`; `0` disables) |
 | `LETTERBOXD_MIDDLEMAN_URL` | Optional. letterboxd-middleman base URL. Empty = skip Letterboxd. From Docker: `http://letterboxd-middleman:8787` (shared `media-ai` network) |
 | `LETTERBOXD_MIDDLEMAN_API_KEY` | Optional. Same secret as the middleman's `MIDDLEMAN_API_KEY` |
 | `LETTERBOXD_MOVIES_PER_JOB` | Max movies to look up per post (default `4`; `0` disables) |
@@ -83,17 +85,19 @@ no X API key or login is needed for text and photos. Only the single post you se
 is read — threads are not unrolled, though a quoted post's text and links are included.
 
 By default an X post is **extracted like a TikTok**: the model writes a title and
-summary and pulls out books, movies, and other items. Photos and (when present)
-video are downloaded to feed the model. Set `X_USE_LLM=false` if you would rather
-capture the post verbatim with no OpenRouter call — those notes are the post's
-own text, a `## Links` section, and a `## Media` section, and they are free.
+summary and pulls out books, movies, and other items. Photos are downloaded to
+feed the model; attached video is only transcribed/sampled when the post has no
+usable text or link previews (video analysis is mainly for TikTok). Set
+`X_USE_LLM=false` if you would rather capture the post verbatim with no
+OpenRouter call — those notes are the post's own text, a `## Links` section, and
+a `## Media` section, and they are free.
 
 Photos, videos, and GIFs are all downloaded into `OBSIDIAN_ATTACHMENTS_DIR` (by
 default an `attachments` folder beside your notes) and embedded as `![[...]]`
 wikilinks, which Obsidian renders as an inline player for video. X serves animated
 GIFs as `.mp4`, so they are saved that way too. Vault files are copied only when
 you tap **Save to Obsidian**, so dismissing the note leaves the vault untouched.
-Hardcover and Letterboxd are updated before that choice.
+Hardcover, Goodreads, and Letterboxd are updated before that choice.
 
 Files above `MAX_ATTACHMENT_MB` (100 by default) are skipped and the note falls back
 to a plain link, so one huge video cannot fill your vault.
@@ -113,8 +117,8 @@ x.com cookies if you hit that. Text, links, and photos never need cookies.
 ## Usage
 
 1. Share a TikTok URL (`tiktok.com` / `vm.tiktok.com` / `vt.tiktok.com`) or an X post URL to the bot.
-2. Wait while it extracts the post. Books are added to Hardcover and movies to Letterboxd when those are configured. The reply says what was added.
-3. Tap **Save to Obsidian** to keep a Markdown note, or **Dismiss** to skip it. Dismiss does not undo the catalog update.
+2. Wait while it extracts the post. Books are added to Hardcover/Goodreads and movies to Letterboxd when those are configured. The reply says what was added.
+3. For tools, news, and other non-catalog items, tap **Save to Obsidian** to keep a Markdown note, or **Dismiss** to skip it. Book/movie-only extracts have no save keyboard — catalogs already handled them. Dismiss does not undo the catalog update.
 
 Both sources write into the same vault folder. Notes are tagged `[tiktok, extract]`
 or `[x, extract]` and carry a `source_kind` frontmatter field, so they stay easy to
@@ -131,8 +135,27 @@ are searched by title and author. When those queries miss and the title looks
 translated, the bot asks for the English or original catalog title and searches that
 with the author. A confident match that is not already on your shelf is added as
 Want to Read. Any existing status is left alone. Failed matches do not write to
-Hardcover. This happens whether or not you save the note. If you do, matched books
-get a `[hardcover](...)` link.
+Hardcover. This happens whether or not an Obsidian note is offered. Book-only
+extracts skip the vault; mixed notes that you do save get a `[hardcover](...)` link.
+
+## Goodreads
+
+Optional. Goodreads no longer issues public API keys, so this uses your logged-in
+browser session. Copy the `_session_id2` cookie value from goodreads.com (or paste a
+full `Cookie` header) into `GOODREADS_COOKIE`. Empty = skip Goodreads.
+
+After extraction, `book` items (not low-confidence) from TikTok or X are searched via
+Goodreads autocomplete by title and author. When those queries miss and the title looks
+translated, the bot asks for the English or original catalog title and searches that
+with the author. A confident match that is not already on an exclusive shelf is added
+as Want to Read. Any existing exclusive status (`to-read`, `currently-reading`, `read`)
+is left alone. Failed matches do not write to Goodreads. This happens whether or not
+an Obsidian note is offered. Book-only extracts skip the vault; mixed notes that
+you do save get a `[goodreads](...)` link.
+
+Hardcover and Goodreads can both run on the same extract when both are configured.
+`docker compose logs bot | grep goodreads` shows each lookup. Session cookies expire;
+refresh `GOODREADS_COOKIE` if adds start failing with auth errors.
 
 ## Letterboxd
 
@@ -157,12 +180,13 @@ Appium can take tens of seconds per film, so the bot says it is adding movies
 before the preview, and caps lookups at `LETTERBOXD_MOVIES_PER_JOB` (default 4).
 
 A post with only books never talks to Letterboxd. A post with only movies never
-talks to Hardcover. A mixed extract dispatches each item to its own service.
+talks to Hardcover or Goodreads. A mixed extract dispatches each item to its own
+service.
 
 ## Local CLI (optional)
 
-For debugging without Telegram, run inside the container. A run updates Hardcover
-and Letterboxd when those are configured. `--save` also writes the note:
+For debugging without Telegram, run inside the container. A run updates Hardcover,
+Goodreads, and Letterboxd when those are configured. `--save` also writes the note:
 
 ```bash
 docker compose exec bot python -m app.cli "https://www.tiktok.com/@user/video/123"
@@ -209,10 +233,13 @@ Notes on behaviour:
 - If `HARDCOVER_API_KEY` is set, each processed post looks up extracted **books**
   on [Hardcover](https://hardcover.app) from TikTok or X and marks confident matches
   **Want to Read**. Books already on your shelf (any status) are left unchanged.
-  Skipping the Obsidian note does not undo that. Unmatched or failed lookups still
-  leave the optional note available. New scoped tokens need catalog search,
-  own-library read, and `insert_user_book` write.
+  Book-only extracts skip Obsidian; catalog sync still runs. New scoped tokens
+  need catalog search, own-library read, and `insert_user_book` write.
   `docker compose logs bot | grep hardcover` shows each lookup.
+- If `GOODREADS_COOKIE` is set, each processed post also looks up extracted **books**
+  on [Goodreads](https://www.goodreads.com) and marks confident matches **Want to Read**.
+  Books already on an exclusive shelf are left unchanged. Skipping the note does not
+  undo that. `docker compose logs bot | grep goodreads` shows each lookup.
 - If `LETTERBOXD_MIDDLEMAN_URL` and `LETTERBOXD_MIDDLEMAN_API_KEY` are set, each
   processed post sends extracted **movies** to letterboxd-middleman
   (`POST /watchlist`) and adds confident matches to your Letterboxd watchlist.
@@ -238,10 +265,11 @@ Notes on behaviour:
 6. OpenRouter multimodal → structured JSON (tools / books / movies / music)
 7. Optional: Kagi Search API fills a few missing item URLs (skipped without `KAGI_API_KEY`)
 8. Always delete temp job directory
-9. Books → Hardcover Want to Read; movies → Letterboxd watchlist
-   (a type that is absent is skipped). Independent of the note
-10. Telegram preview plus an optional save keyboard. Photos are copied into the
-    vault only if you save the note
+9. Books → Hardcover and/or Goodreads Want to Read; movies → Letterboxd watchlist
+   (a type or service that is absent is skipped). Independent of the note
+10. Telegram preview plus an optional save keyboard when the extract has tools,
+    news, or other non-catalog items (book/movie-only skips it). Photos are
+    copied into the vault only if you save the note
 
 ## Token cost controls
 
@@ -283,6 +311,7 @@ app/
   openrouter.py   Multimodal extraction client
   kagi.py         Optional Kagi Search API client (direct page URLs)
   hardcover.py    Optional Hardcover client (Want to Read after extract)
+  goodreads.py    Optional Goodreads client (Want to Read after extract)
   letterboxd.py   Optional letterboxd-middleman client (watchlist after extract)
   obsidian.py     Markdown renderer + atomic vault write
   config.py       Settings from env

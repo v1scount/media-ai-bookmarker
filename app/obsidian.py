@@ -21,10 +21,26 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
+# Books and movies go to Hardcover/Goodreads/Letterboxd; Obsidian is for the rest.
+CATALOG_ONLY_TYPES = frozenset({EntityType.book, EntityType.movie})
+
 SOURCE_LABELS: dict[SourceKind, str] = {
     SourceKind.tiktok: "TikTok extract",
     SourceKind.x: "X extract",
 }
+
+
+def wants_obsidian_note(result: ExtractionResult) -> bool:
+    """Whether this extract is worth an optional vault note.
+
+    Book- and movie-only results are handled by the catalogs. Tools, articles,
+    products, and anything else still get the Save keyboard / ``--save``.
+    Verbatim captures and extracts with no typed items stay eligible.
+    """
+    entities = result.entities
+    if not entities:
+        return True
+    return any(entity.type not in CATALOG_ONLY_TYPES for entity in entities)
 
 WINDOWS_FORBIDDEN = re.compile(r'[<>:"/\\|?*]')
 FILENAME_MAX_LEN = 80
@@ -71,6 +87,8 @@ def _render_entity_links(entity: Entity, amazon_host: str) -> list[str]:
         lines.append(f"- [search]({entity.search_url})")
     if entity.hardcover_url:
         lines.append(f"- [hardcover]({entity.hardcover_url})")
+    if entity.goodreads_url:
+        lines.append(f"- [goodreads]({entity.goodreads_url})")
     if entity.letterboxd_url:
         lines.append(f"- [letterboxd]({entity.letterboxd_url})")
     return lines

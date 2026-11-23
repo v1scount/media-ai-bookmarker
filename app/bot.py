@@ -18,6 +18,12 @@ from telegram.ext import (
 )
 
 from app.config import Settings, get_settings
+from app.goodreads import (
+    GoodreadsAction,
+    GoodreadsClient,
+    format_goodreads_report,
+    select_goodreads_candidates,
+)
 from app.hardcover import (
     HardcoverAction,
     HardcoverClient,
@@ -33,7 +39,7 @@ from app.letterboxd import (
     select_letterboxd_candidates,
 )
 from app.models import ExtractionResult, extract_supported_url
-from app.obsidian import relative_vault_path, save_to_obsidian
+from app.obsidian import relative_vault_path, save_to_obsidian, wants_obsidian_note
 from app.openrouter import OpenRouterClient
 from app.pipeline import Pipeline, format_preview
 
@@ -99,9 +105,11 @@ def _catalog_progress(
     hardcover: HardcoverClient | None,
     letterboxd: LetterboxdClient | None,
     result: ExtractionResult,
+    goodreads: GoodreadsClient | None = None,
 ) -> str | None:
-    """Status line before a catalog write. None when neither service will run."""
-    books = (
+    """Status line before a catalog write. None when no service will run."""
+    book_targets: list[str] = []
+    if (
         hardcover is not None
         and hardcover.enabled
         and bool(
@@ -109,7 +117,18 @@ def _catalog_progress(
                 result.entities, settings.hardcover_books_per_job
             )
         )
-    )
+    ):
+        book_targets.append("Hardcover")
+    if (
+        goodreads is not None
+        and goodreads.enabled
+        and bool(
+            select_goodreads_candidates(
+                result.entities, settings.goodreads_books_per_job
+            )
+        )
+    ):
+        book_targets.append("Goodreads")
     movies = (
         letterboxd is not None
         and letterboxd.enabled
@@ -119,23 +138,26 @@ def _catalog_progress(
             )
         )
     )
-    if books and movies:
-        return "Adding books to Hardcover and movies to Letterboxd…"
+    parts: list[str] = []
+    if book_targets:
+        parts.append(f"books to {' and '.join(book_targets)}")
     if movies:
-        return "Adding movies to Letterboxd…"
-    if books:
-        return "Adding books to Hardcover…"
-    return None
+        parts.append("movies to Letterboxd")
+    if not parts:
+        return None
+    return "Adding " + " and ".join(parts) + "…"
 
 
 def _catalog_report(
     hardcover_actions: list[HardcoverAction],
     letterboxd_actions: list[LetterboxdAction],
+    goodreads_actions: list[GoodreadsAction] | None = None,
 ) -> str:
     parts = [
         report
         for report in (
             format_hardcover_report(hardcover_actions),
+            format_goodreads_report(goodreads_actions or []),
             format_letterboxd_report(letterboxd_actions),
         )
         if report
@@ -152,8 +174,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "Send me a TikTok or X (Twitter) link. I'll extract tools, books, movies, "
-        "and music. Books go to Hardcover and movies to Letterboxd when those are "
-        "configured. Saving a Markdown note to Obsidian is optional."
+        "and music. Books go to Hardcover/Goodreads and movies to Letterboxd when "
+        "those are configured. Tools, news, and other non-catalog items can "
+        "optionally be saved as an Obsidian note."
     )
 
 
@@ -208,9 +231,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
 
     hardcover: HardcoverClient | None = context.application.bot_data.get("hardcover")
+    goodreads: GoodreadsClient | None = context.application.bot_data.get("goodreads")
     letterboxd: LetterboxdClient | None = context.application.bot_data.get("letterboxd")
     hardcover_actions: list[HardcoverAction] = []
     letterboxd_actions: list[LetterboxdAction] = []
+    goodreads_actions: list[GoodreadsAction] = []
     sync_note = ""
 
     async with job_lock:
@@ -227,24 +252,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await status.edit_text(f"Failed to process link:\n{err}")
             return
 
-        notice = _catalog_progress(settings, hardcover, letterboxd, result)
+        notice = _catalog_progress(
+            settings, hardcover, letterboxd, result, goodreads
+        )
         if notice:
             await progress_cb(notice)
         try:
-            hardcover_actions, letterboxd_actions = await sync_catalogs(
-                settings, hardcover, result, letterboxd
+            hardcover_actions, letterboxd_actions, goodreads_actions = (
+                await sync_catalogs(
+                    settings, hardcover, result, letterboxd, goodreads
+                )
             )
         except Exception:
             logger.exception("Catalog sync failed for %s", url)
-            sync_note = "Could not update Hardcover or Letterboxd."
+            sync_note = "Could not update Hardcover, Goodreads, or Letterboxd."
 
-    result_id = await _store_result(result)
+    offer_note = wants_obsidian_note(result)
+    result_id = await _store_result(result) if offer_note else ""
     preview = format_preview(result, amazon_host=settings.amazon_search_host)
     # Telegram message limit ~4096; trim if needed
     if len(preview) > 3900:
         preview = preview[:3900] + "\n…"
 
-    reply_markup = _save_keyboard(result_id)
+    reply_markup = _save_keyboard(result_id) if offer_note else None
     try:
         await status.edit_text(
             preview,
@@ -264,7 +294,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             disable_web_page_preview=True,
         )
 
-    report = _catalog_report(hardcover_actions, letterboxd_actions)
+    report = _catalog_report(
+        hardcover_actions, letterboxd_actions, goodreads_actions
+    )
     if sync_note:
         report = f"{sync_note}\n\n{report}" if report else sync_note
     if report:
@@ -336,12 +368,16 @@ async def post_init(application: Application) -> None:
     hardcover = HardcoverClient(
         settings, title_translator=openrouter.book_catalog_title
     )
+    goodreads = GoodreadsClient(
+        settings, title_translator=openrouter.book_catalog_title
+    )
     letterboxd = LetterboxdClient(settings)
     pipeline = Pipeline(settings, openrouter, kagi)
     application.bot_data["settings"] = settings
     application.bot_data["openrouter"] = openrouter
     application.bot_data["kagi"] = kagi
     application.bot_data["hardcover"] = hardcover
+    application.bot_data["goodreads"] = goodreads
     application.bot_data["letterboxd"] = letterboxd
     application.bot_data["pipeline"] = pipeline
     application.bot_data["job_lock"] = asyncio.Lock()
@@ -373,6 +409,9 @@ async def post_shutdown(application: Application) -> None:
     hardcover: HardcoverClient | None = application.bot_data.get("hardcover")
     if hardcover:
         await hardcover.aclose()
+    goodreads: GoodreadsClient | None = application.bot_data.get("goodreads")
+    if goodreads:
+        await goodreads.aclose()
     letterboxd: LetterboxdClient | None = application.bot_data.get("letterboxd")
     if letterboxd:
         await letterboxd.aclose()

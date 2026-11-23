@@ -157,6 +157,20 @@ class Settings(BaseSettings):
         ge=1.0,
         le=60.0,
     )
+    # Optional. Empty = skip Goodreads. Browser `_session_id2` cookie for Want to Read.
+    goodreads_cookie: str = Field(default="", alias="GOODREADS_COOKIE")
+    goodreads_books_per_job: int = Field(
+        default=8,
+        alias="GOODREADS_BOOKS_PER_JOB",
+        ge=0,
+        le=20,
+    )
+    goodreads_timeout_seconds: float = Field(
+        default=20.0,
+        alias="GOODREADS_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=60.0,
+    )
     # Optional. Empty URL or key = skip Letterboxd. Movies only, after each extract.
     letterboxd_middleman_url: str = Field(
         default="",
@@ -194,6 +208,7 @@ class Settings(BaseSettings):
     @field_validator(
         "kagi_api_key",
         "hardcover_api_key",
+        "goodreads_cookie",
         "letterboxd_middleman_api_key",
         mode="before",
     )

@@ -7,7 +7,7 @@ import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 
@@ -19,6 +19,9 @@ from app.letterboxd import (
     select_letterboxd_candidates,
 )
 from app.models import Confidence, Entity, EntityType, ExtractionResult
+
+if TYPE_CHECKING:
+    from app.goodreads import GoodreadsAction, GoodreadsClient
 
 logger = logging.getLogger(__name__)
 
@@ -766,25 +769,40 @@ async def sync_catalogs(
     hardcover: HardcoverClient | None,
     result: ExtractionResult,
     letterboxd: LetterboxdClient | None = None,
-) -> tuple[list[HardcoverAction], list[LetterboxdAction]]:
+    goodreads: GoodreadsClient | None = None,
+) -> tuple[list[HardcoverAction], list[LetterboxdAction], list[GoodreadsAction]]:
     """Dispatch by entity type. Fail-soft. Does not write an Obsidian note.
 
-    Books go to Hardcover; movies go to Letterboxd. A service is not called
-    when that type is absent or the client is disabled. Mixed extracts hit
-    both. Saving the note is a separate, optional step.
+    Books go to Hardcover and/or Goodreads when those are enabled; movies go
+    to Letterboxd. A service is not called when that type is absent or the
+    client is disabled. Mixed extracts hit each configured sink. Saving the
+    note is a separate, optional step.
     """
+    from app.goodreads import (
+        GoodreadsAction,
+        apply_goodreads_actions,
+        select_goodreads_candidates,
+    )
+
     hardcover_actions: list[HardcoverAction] = []
     letterboxd_actions: list[LetterboxdAction] = []
+    goodreads_actions: list[GoodreadsAction] = []
     if hardcover is not None and hardcover.enabled:
         if select_hardcover_candidates(
             result.entities, settings.hardcover_books_per_job
         ):
             hardcover_actions = await hardcover.sync_books(result.entities)
             apply_hardcover_actions(result.entities, hardcover_actions)
+    if goodreads is not None and goodreads.enabled:
+        if select_goodreads_candidates(
+            result.entities, settings.goodreads_books_per_job
+        ):
+            goodreads_actions = await goodreads.sync_books(result.entities)
+            apply_goodreads_actions(result.entities, goodreads_actions)
     if letterboxd is not None and letterboxd.enabled:
         if select_letterboxd_candidates(
             result.entities, settings.letterboxd_movies_per_job
         ):
             letterboxd_actions = await letterboxd.sync_movies(result.entities)
             apply_letterboxd_actions(result.entities, letterboxd_actions)
-    return hardcover_actions, letterboxd_actions
+    return hardcover_actions, letterboxd_actions, goodreads_actions
